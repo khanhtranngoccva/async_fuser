@@ -1,9 +1,8 @@
-//! FUSE userspace library implementation
+//! Asynchronous FUSE userspace library implementation
 //!
-//! This is an improved rewrite of the FUSE userspace library (lowlevel interface) to fully take
-//! advantage of Rust's architecture. The only thing we rely on in the real libfuse are mount
-//! and unmount calls which are needed to establish a fd to talk to the kernel driver.
-
+//! This is an async aware port of the [fuser](https://docs.rs/fuser) library, which aims
+//! to allow integrating async filesystem code, which in turns enables usage of asynchronous
+//! filesystem APIs like `io_uring` to reduce overhead and minimize blocking.
 #![warn(
     missing_docs,
     missing_debug_implementations,

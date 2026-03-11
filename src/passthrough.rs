@@ -54,16 +54,17 @@ impl BackingId {
             ));
         }
         // FIXME: Find a non-blocking version of IOC_BACKING_OPEN
-        let id = tokio::task::block_in_place(|| unsafe {
-            let fuse_dev = fuse_dev.as_fd().as_raw_fd();
-            let fd = fd.as_fd().as_raw_fd() as u32;
+        let fuse_dev_raw = fuse_dev.as_fd().as_raw_fd();
+        let fd_raw = fd.as_fd().as_raw_fd() as u32;
+        let id = tokio::task::spawn_blocking(move || unsafe {
             let map = fuse_backing_map {
-                fd: fd,
+                fd: fd_raw,
                 flags: 0,
                 padding: 0,
             };
-            fuse_dev_ioc_backing_open(fuse_dev, &map)
-        })?;
+            fuse_dev_ioc_backing_open(fuse_dev_raw, &map)
+        })
+        .await??;
         Ok(id as u32)
     }
 

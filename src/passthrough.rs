@@ -98,6 +98,7 @@ impl BackingId {
 }
 
 impl Drop for BackingId {
+    // Note: This code is blocking.
     fn drop(&mut self) {
         if let Some(ch) = self.channel.upgrade() {
             if let Err(e) = unsafe { fuse_dev_ioc_backing_close(ch.as_raw_fd(), &self.backing_id) }

@@ -26,6 +26,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 use tokio::process::Command;
+use tokio::runtime::Runtime;
 
 use log::debug;
 use log::error;
@@ -152,7 +153,10 @@ impl Drop for MountImpl {
         }
         let flags = super::drop_umount_flags();
         let mountpoint = owned_state.as_ref().unwrap().mountpoint.clone();
-        tokio::spawn(async move {
+        // Create a temporary runtime to force an unmount. 
+        // Most of the time, the user should call the umount methods
+        let runtime = Runtime::new().expect("should be able to create a temporary runtime");
+        runtime.block_on(async move {
             while owned_state.is_some() {
                 match unmount_state_obj(&mut owned_state, &flags).await {
                     Ok(()) => return,

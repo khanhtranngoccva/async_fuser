@@ -152,6 +152,7 @@ impl ReplyRaw {
 
 impl Drop for ReplyRaw {
     fn drop(&mut self) {
+        // FIXME: Do not use async finalizers to release this object, may cause leak if runtime is terminated
         let _ = self.sender.take().map(|sender| {
             let request_id = self.unique.clone();
             warn!(

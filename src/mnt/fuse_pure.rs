@@ -26,7 +26,6 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 use tokio::process::Command;
-use tokio::runtime::Runtime;
 
 use log::debug;
 use log::error;
@@ -50,6 +49,7 @@ use crate::mnt::mount_options::option_to_flag;
 use crate::mnt::mount_options::option_to_string;
 use crate::mnt::unmount_options;
 use crate::mnt::unmount_options::UnmountOption;
+use crate::runtime;
 
 const FUSERMOUNT_BIN: &str = "fusermount";
 const FUSERMOUNT3_BIN: &str = "fusermount3";
@@ -153,19 +153,18 @@ impl Drop for MountImpl {
         }
         let flags = super::drop_umount_flags();
         let mountpoint = owned_state.as_ref().unwrap().mountpoint.clone();
-        // Create a temporary runtime to force an unmount. 
-        // Most of the time, the user should call the umount methods
-        let runtime = Runtime::new().expect("should be able to create a temporary runtime");
-        runtime.block_on(async move {
+        // Use a temporary runtime to force a proper cleanup. Most of the time, the caller should call the
+        // async umount_impl method to unmount the filesystem. In the future, the AsyncDrop trait should be used
+        runtime::execute_future_from_sync(async move {
             while owned_state.is_some() {
                 match unmount_state_obj(&mut owned_state, &flags).await {
                     Ok(()) => return,
                     Err(err) => {
                         let err_kind = err.kind();
                         if err_kind == io::ErrorKind::ResourceBusy {
-                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         } else if err_kind == io::ErrorKind::WouldBlock {
-                            std::thread::sleep(std::time::Duration::from_secs_f64(0.01));
+                            tokio::time::sleep(std::time::Duration::from_secs_f64(0.01)).await;
                         } else {
                             log::error!("Error unmounting filesystem at {:?}: {err}", mountpoint);
                             return;

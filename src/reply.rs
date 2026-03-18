@@ -33,6 +33,7 @@ use crate::ll::reply::DirEntryPlus;
 use crate::ll::reply::Response;
 use crate::ll::{self};
 use crate::passthrough::BackingId;
+use crate::runtime;
 
 /// Generic reply callback to send data
 #[derive(Debug)]
@@ -152,7 +153,6 @@ impl ReplyRaw {
 
 impl Drop for ReplyRaw {
     fn drop(&mut self) {
-        // FIXME: Do not use async finalizers to release this object, may cause leak if runtime is terminated
         let _ = self.sender.take().map(|sender| {
             let request_id = self.unique.clone();
             warn!(
@@ -160,7 +160,7 @@ impl Drop for ReplyRaw {
                 request_id.0
             );
             // Inline implementation of send_ll_mut to satisfy compiler rules
-            tokio::spawn(async move {
+            runtime::execute_future_from_sync(async move {
                 let res = ll::ResponseErrno(ll::Errno::EIO)
                     .with_iovec(request_id, async |iov| sender.send(iov).await)
                     .await;

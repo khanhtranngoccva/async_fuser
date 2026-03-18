@@ -48,6 +48,7 @@ pub use crate::ll::request::FileHandle;
 pub use crate::ll::request::INodeNo;
 pub use crate::ll::request::LockOwner;
 pub use crate::ll::request::Version;
+use crate::mnt::mount_options;
 pub use crate::mnt::mount_options::Config;
 pub use crate::mnt::mount_options::MountOption;
 pub use crate::mnt::unmount_options::UnmountOption;
@@ -92,6 +93,7 @@ mod read_buf;
 mod reply;
 mod request;
 mod request_param;
+mod runtime;
 mod session;
 mod time;
 
@@ -1026,4 +1028,41 @@ pub trait Filesystem: Send + Sync + 'static {
         warn!("[Not Implemented] getxtimes(ino: {ino:#x?})");
         reply.error(Errno::ENOSYS);
     }
+}
+
+/// Mount the given filesystem to the given mountpoint. This function will
+/// not return until the filesystem is unmounted.
+///
+/// # Errors
+/// Returns an error if the options are incorrect, or if the fuse device can't be mounted,
+/// and any final error when the session comes to an end.
+pub async fn mount<FS: Filesystem, P: AsRef<Path>>(
+    filesystem: FS,
+    mountpoint: P,
+    options: &Config,
+) -> io::Result<()> {
+    mount_options::check_option_conflicts(options)?;
+    let session = Session::new(filesystem, mountpoint.as_ref(), options).await?;
+    session.run().await?;
+    Ok(())
+}
+
+/// Mount the given filesystem to the given mountpoint. This function spawns
+/// a background thread to handle filesystem operations while being mounted
+/// and therefore returns immediately. The returned handle should be stored
+/// to reference the mounted filesystem. If it's dropped, the filesystem will
+/// be unmounted.
+///
+/// NOTE: This is the corresponding function to mount.
+/// # Errors
+/// Returns an error if the options are incorrect, or if the fuse device can't be mounted.
+pub async fn spawn_mount<FS: Filesystem + Send + 'static, P: AsRef<Path>>(
+    filesystem: FS,
+    mountpoint: P,
+    options: &Config,
+) -> io::Result<BackgroundSession> {
+    mount_options::check_option_conflicts(options)?;
+    let session = Session::new(filesystem, mountpoint.as_ref(), options).await?;
+    let bg_session = session.spawn()?;
+    Ok(bg_session)
 }

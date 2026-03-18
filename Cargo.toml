@@ -32,3 +32,4 @@ serializable = ["serde"]
 # Can be used like this on Linux to check macOS code compiles:
 # cargo check --target x86_64-apple-darwin --features=macos-no-mount
 macos-no-mount = []
+io_uring = ["tokio/io-uring"]

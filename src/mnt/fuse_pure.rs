@@ -14,6 +14,7 @@ use std::io::IoSliceMut;
 use std::mem;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
@@ -338,7 +339,7 @@ async fn receive_fusermount_message(socket: &UnixStream) -> Result<DevFuse, Erro
                     if fd < 0 {
                         return Err(ErrorKind::InvalidData.into());
                     }
-                    return Ok(DevFuse(unsafe { File::from_raw_fd(fd) }));
+                    return Ok(DevFuse::try_from_fd(unsafe { OwnedFd::from_raw_fd(fd) }).await?);
                 }
             }
             other => {

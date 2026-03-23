@@ -14,7 +14,6 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::fs::File;
 use tokio::task::JoinHandle;
 
 use log::debug;
@@ -215,8 +214,7 @@ impl<FS: Filesystem> Session<FS> {
         acl: SessionACL,
         config: Config,
     ) -> io::Result<Self> {
-        let file = File::from_std(std::fs::File::from(fd));
-        let ch = Channel::new(Arc::new(DevFuse(file)));
+        let ch = Channel::new(Arc::new(DevFuse::try_from_fd(fd).await?));
         let mut session = Session {
             filesystem: FilesystemHolder {
                 fs: Some(filesystem),

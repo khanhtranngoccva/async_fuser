@@ -1,6 +1,4 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-use crate::{dev_fuse::DevFuse, io_utils::BorrowedFile, passthrough::BackingId};
+use crate::{dev_fuse::DevFuse, passthrough::BackingId};
 use std::{
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
@@ -12,7 +10,7 @@ pub(crate) struct Channel(Arc<DevFuse>);
 
 impl AsFd for Channel {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        <Arc<DevFuse> as AsFd>::as_fd(&self.0)
     }
 }
 
@@ -32,8 +30,8 @@ impl Channel {
 
     /// Receives data up to the capacity of the buffer.
     async fn receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        let mut borrowed_file = unsafe { BorrowedFile::new(&self.0) };
-        borrowed_file.read(buffer).await
+        let mut upgraded_target = unsafe { self.0.client.to_target(self.0.file.as_ref()) };
+        self.0.client.read(&mut upgraded_target, buffer).await
     }
 
     /// Receives data up to the capacity of the given buffer, retrying on errors that are safe to retry
@@ -71,19 +69,8 @@ impl Channel {
     /// Requires Linux 4.5+. Returns an error on older kernels or non-Linux.
     #[cfg(target_os = "linux")]
     pub(crate) async fn clone_fd(&self) -> io::Result<Channel> {
-        let new_device = DevFuse::open().await?;
-        let old_channel = self.0.clone();
-        // SAFETY: fuse_dev_ioc_clone is a valid ioctl for /dev/fuse
-        let new_device = tokio::task::spawn_blocking(move || -> io::Result<DevFuse> {
-            let mut source_fd = old_channel.as_raw_fd() as u32;
-            unsafe {
-                crate::ll::ioctl::fuse_dev_ioc_clone(new_device.as_raw_fd(), &mut source_fd)?
-            };
-            Ok(new_device)
-        })
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
-        Ok(Channel::new(Arc::new(new_device)))
+        let devfuse = self.0.clone_fd().await?;
+        Ok(Channel::new(Arc::new(devfuse)))
     }
 }
 
@@ -92,7 +79,7 @@ pub(crate) struct ChannelSender(Arc<DevFuse>);
 
 impl AsFd for ChannelSender {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        <Arc<DevFuse> as AsFd>::as_fd(&self.0)
     }
 }
 
@@ -104,8 +91,13 @@ impl AsRawFd for ChannelSender {
 
 impl ChannelSender {
     pub(crate) async fn send(&self, buffers: &[io::IoSlice<'_>]) -> io::Result<()> {
-        let mut borrowed_file = unsafe { BorrowedFile::new(&self.0) };
-        let rc = borrowed_file.write_vectored(buffers).await?;
+        let mut upgraded_target = unsafe { self.0.client.to_target(self.0.file.as_ref()) };
+        // SAFETY: parallel write to /dev/fuse is supported, and the target is not changed in the call.
+        let rc = self
+            .0
+            .client
+            .write_vectored(&mut upgraded_target, buffers)
+            .await?;
         // writev is atomic, so do not need to check how many bytes are written.
         // libfuse does not do it either
         // https://github.com/libfuse/libfuse/blob/6278995cca991978abd25ebb2c20ebd3fc9e8a13/lib/fuse_lowlevel.c#L267

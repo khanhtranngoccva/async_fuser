@@ -258,6 +258,17 @@ impl ReplyEntry {
             .await;
     }
 
+    /// Open a backing ID. This allows the backing ID to be populated immediately at the lookup phase, before the inode is opened. The client may then use the backing ID in any future open and create requests.
+    #[instability::unstable(feature = "lookup-backing")]
+    pub async fn open_backing(&self, fd: impl std::os::fd::AsFd) -> std::io::Result<BackingId> {
+        self.reply
+            .sender
+            .as_ref()
+            .unwrap()
+            .open_backing(fd.as_fd())
+            .await
+    }
+
     /// Reply to a request with the given error code
     pub async fn error(self, err: Errno) {
         self.reply.error(err).await;

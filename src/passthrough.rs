@@ -54,18 +54,25 @@ impl BackingId {
             ));
         }
         // FIXME: Find a non-blocking version of IOC_BACKING_OPEN
-        let fuse_dev_raw = fuse_dev.as_fd().as_raw_fd();
-        let fd_raw = fd.as_fd().as_raw_fd() as u32;
-        let id = tokio::task::spawn_blocking(move || unsafe {
-            let map = fuse_backing_map {
-                fd: fd_raw,
-                flags: 0,
-                padding: 0,
-            };
-            fuse_dev_ioc_backing_open(fuse_dev_raw, &map)
-        })
-        .await??;
-        Ok(id as u32)
+        let fuse_dev_borrowed = fuse_dev.as_fd();
+        let fd_borrowed = fd.as_fd();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(|scope| {
+                scope.spawn_blocking(move || -> Result<u32, std::io::Error> {
+                    let map = fuse_backing_map {
+                        fd: fd_borrowed.as_raw_fd() as u32,
+                        flags: 0,
+                        padding: 0,
+                    };
+                    let id = fuse_dev_ioc_backing_open(fuse_dev_borrowed.as_raw_fd(), &map)?;
+                    Ok(id as u32)
+                });
+            })
+        }
+        .await;
+        let future = futures.pop().expect("no future returned");
+        let id = future.expect("failed to join future")?;
+        Ok(id)
     }
 
     pub(crate) async fn create(channel: &Arc<DevFuse>, fd: impl AsFd) -> std::io::Result<Self> {
@@ -73,6 +80,28 @@ impl BackingId {
             channel: Arc::downgrade(channel),
             backing_id: Self::create_raw(channel, fd).await?,
         })
+    }
+
+    /// Closes the backing file reference asynchronously.
+    /// If the channel has been dropped, the function returns without doing anything.
+    pub async fn close(mut self) -> std::io::Result<()> {
+        let channel = std::mem::take(&mut self.channel);
+        let channel = match channel.upgrade() {
+            Some(channel) => channel,
+            None => return Ok(()),
+        };
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(|scope| {
+                scope.spawn_blocking(move || -> std::io::Result<()> {
+                    fuse_dev_ioc_backing_close(channel.as_raw_fd(), &self.backing_id)?;
+                    Ok(())
+                });
+            })
+        }
+        .await;
+        let future = futures.pop().expect("no future returned");
+        future.expect("failed to join future")?;
+        Ok(())
     }
 
     pub(crate) unsafe fn wrap_raw(channel: &Arc<DevFuse>, id: u32) -> Self {

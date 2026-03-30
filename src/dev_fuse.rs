@@ -16,19 +16,23 @@ pub(crate) struct DevFuse {
 
 impl std::fmt::Debug for DevFuse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DevFuse(fd={})", self.file.as_fd().as_raw_fd())
+        write!(
+            f,
+            "DevFuse(fd={})",
+            self.file.as_file_descriptor().as_raw_fd()
+        )
     }
 }
 
 impl AsRawFd for DevFuse {
     fn as_raw_fd(&self) -> RawFd {
-        self.file.as_fd().as_raw_fd()
+        self.file.as_file_descriptor().as_raw_fd()
     }
 }
 
 impl AsFd for DevFuse {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.file.as_fd()
+        self.file.as_file_descriptor()
     }
 }
 
@@ -90,14 +94,23 @@ impl DevFuse {
             .open_path(Self::PATH, OFlag::O_RDWR, Permissions::from_mode(0))
             .await?;
         // SAFETY: fuse_dev_ioc_clone is a valid ioctl for /dev/fuse
-        let target_raw_fd = fuse.as_raw_fd();
-        let mut source_fd = self.file.as_fd().as_raw_fd() as u32;
-        tokio::task::spawn_blocking(move || -> io::Result<()> {
-            unsafe { crate::ll::ioctl::fuse_dev_ioc_clone(target_raw_fd, &mut source_fd)? };
-            Ok(())
-        })
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+        let target_fd_borrowed = fuse.as_fd();
+        let source_fd_borrowed = self.file.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(|scope| {
+                scope.spawn_blocking(move || -> io::Result<()> {
+                    let mut source_fd_raw = source_fd_borrowed.as_raw_fd() as u32;
+                    crate::ll::ioctl::fuse_dev_ioc_clone(
+                        target_fd_borrowed.as_raw_fd(),
+                        &mut source_fd_raw,
+                    )?;
+                    Ok(())
+                });
+            })
+        }
+        .await;
+        let future = futures.pop().expect("no future returned");
+        future.expect("failed to join future")?;
         let registered = client
             .register_owned(fuse)
             .map::<Box<dyn UringTarget + Send + Sync>, _>(|f| Box::new(f))

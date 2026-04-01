@@ -19,20 +19,20 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::io::RawFd;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::task::Poll;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::net::UnixStream;
 use tokio::process::Command;
 
 use log::debug;
 use log::error;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::FdFlag;
-use nix::fcntl::OFlag;
 use nix::fcntl::fcntl;
 use nix::sys::socket::ControlMessageOwned;
 use nix::sys::socket::MsgFlags;
@@ -435,24 +435,18 @@ async fn fuse_mount_fusermount(
         debug!("fusermount: {}", String::from_utf8_lossy(&output.stderr));
     } else {
         if let Some(mut stdout) = fusermount_child.stdout {
-            // TODO: do not ignore error.
-            if let Ok(flags) = fcntl(&stdout, FcntlArg::F_GETFL) {
-                let new_flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
-                let _ = fcntl(&stdout, FcntlArg::F_SETFL(new_flags));
-            }
             let mut buf = vec![0; 64 * 1024];
-            if let Ok(len) = stdout.read(&mut buf).await {
+            let read = Box::pin(stdout.read(&mut buf));
+            let poll_result = futures::poll!(read);
+            if let Poll::Ready(Ok(len)) = poll_result {
                 debug!("fusermount: {}", String::from_utf8_lossy(&buf[..len]));
             }
         }
         if let Some(mut stderr) = fusermount_child.stderr {
-            // TODO: do not ignore error.
-            if let Ok(flags) = fcntl(&stderr, FcntlArg::F_GETFL) {
-                let new_flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
-                let _ = fcntl(&stderr, FcntlArg::F_SETFL(new_flags));
-            }
             let mut buf = vec![0; 64 * 1024];
-            if let Ok(len) = stderr.read(&mut buf).await {
+            let read = Box::pin(stderr.read(&mut buf));
+            let poll_result = futures::poll!(read);
+            if let Poll::Ready(Ok(len)) = poll_result {
                 debug!("fusermount: {}", String::from_utf8_lossy(&buf[..len]));
             }
         }

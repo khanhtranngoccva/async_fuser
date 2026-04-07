@@ -250,7 +250,7 @@ impl<FS: Filesystem> Session<FS> {
             guard,
             sender,
             mount,
-            cancellation_token: cloned_token,
+            _cancellation_token: cloned_token,
         })
     }
 
@@ -624,7 +624,7 @@ pub struct BackgroundSession {
     /// Ensures the filesystem is unmounted when the session ends
     mount: Option<Mount>,
     /// CancellationToken for the background session
-    cancellation_token: CancellationToken,
+    _cancellation_token: CancellationToken,
 }
 
 impl BackgroundSession {

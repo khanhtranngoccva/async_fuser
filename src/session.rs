@@ -574,7 +574,6 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                 Err(err) => return Err(err.into()),
             };
             loop {
-                log::debug!("fetching nonblocking event");
                 let size = match self
                     .ch
                     .receive_nonblocking(buf, &self.cancellation_token)
@@ -592,7 +591,6 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                     Err(err) if err.raw_os_error() == Some(ENODEV) => return Ok(()),
                     Err(err) => return Err(err.into()),
                 };
-                log::debug!("received event of size {size}");
                 match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
                     Some(req) => {
@@ -647,11 +645,6 @@ impl BackgroundSession {
                 }
             }
         }
-        self.cancellation_token.cancel();
-        log::debug!(
-            "background session token {:?} cancelled, waiting for thread",
-            self.cancellation_token
-        );
         self.guard
             .await
             .map_err(|e| (None, io::Error::new(io::ErrorKind::Other, e)))?
@@ -686,19 +679,13 @@ mod tests {
         let temp_dir = tempdir::TempDir::new("test_session_lifecycle").unwrap();
         let mount_point = temp_dir.path();
 
-        log::info!("creating session");
-
         // Create a session
         let session = Session::new(DummyFS {}, mount_point, &Config::default())
             .await
             .unwrap();
 
-        log::info!("initial session object created");
-
-        // Spawn the session
+        // Spawn the background session
         let bg_session = session.spawn().unwrap();
-
-        log::info!("background session thread spawned");
 
         // Unmount the session
         bg_session.umount_and_join(&[]).await.unwrap();

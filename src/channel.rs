@@ -62,7 +62,6 @@ impl Channel {
             .expect("newly initialized pending IO operation must have a completion");
         let result = tokio::select! {
             _ = cancellation.cancelled() => {
-                log::debug!("cancelling read attempt");
                 match read_attempt.cancel().await {
                     Some(result) => result,
                     None => Err(io::Error::from_raw_os_error(Errno::ECANCELED.into())),

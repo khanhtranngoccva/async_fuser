@@ -1,7 +1,11 @@
-use tokio::io::Interest;
+use tokio::io::{Interest, unix::AsyncFdReadyGuard};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Errno, dev_fuse::DevFuse, passthrough::BackingId};
+use crate::{
+    Errno,
+    dev_fuse::{DevFuse, DevFuseTarget},
+    passthrough::BackingId,
+};
 use std::{
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
@@ -31,46 +35,44 @@ impl Channel {
         Self(device)
     }
 
+    pub(crate) async fn read_ready(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<AsyncFdReadyGuard<'_, DevFuseTarget>, io::Error> {
+        tokio::select! {
+            r = self.0.as_ref().ready(Interest::READABLE) => {
+                r
+            },
+            _ = cancellation.cancelled() => {
+                Err(io::Error::from_raw_os_error(Errno::ECANCELED.into()))
+            }
+        }
+    }
+
     /// Receives data up to the capacity of the buffer, and cancels upon triggering of the CancellationToken.
-    /// Retries on errors that are safe to retry ([`ENOENT`](libc::ENOENT), [`EAGAIN`](libc::EAGAIN), [`EINTR`](libc::EINTR)).
-    pub(crate) async fn poll_and_receive(
+    pub(crate) async fn receive_nonblocking(
         &self,
         buffer: &mut [u8],
         cancellation: &CancellationToken,
     ) -> io::Result<usize> {
-        loop {
-            let _ready_guard = tokio::select! {
-                r = self.0.as_ref().ready(Interest::READABLE) => {
-                    r?
-                },
-                _ = cancellation.cancelled() => {
-                    return Err(io::Error::from_raw_os_error(Errno::ECANCELED.into()));
+        let mut upgraded_target = unsafe { self.0.client.to_target(self.0.as_ref()) };
+        let mut read_attempt = self.0.client.read(&mut upgraded_target, buffer);
+        let completion = read_attempt
+            .completion()
+            .expect("newly initialized pending IO operation must have a completion");
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => {
+                log::debug!("cancelling read attempt");
+                match read_attempt.cancel().await {
+                    Some(result) => result,
+                    None => Err(io::Error::from_raw_os_error(Errno::ECANCELED.into())),
                 }
-            };
-            let mut upgraded_target = unsafe { self.0.client.to_target(self.0.as_ref()) };
-            let mut read_attempt = self.0.client.read(&mut upgraded_target, buffer);
-            let completion = read_attempt
-                .completion()
-                .expect("newly initialized pending IO operation must have a completion");
-            let result = match tokio::select! {
-                result = completion => {
-                    result
-                }
-                _ = cancellation.cancelled() => {
-                    match read_attempt.cancel().await {
-                        Some(result) => result,
-                        None => Err(io::Error::from_raw_os_error(Errno::ECANCELED.into())),
-                    }
-                }
-            } {
-                Ok(result) => result,
-                Err(e) => match e.raw_os_error() {
-                    Some(libc::ENOENT) | Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
-                    _ => return Err(e),
-                },
-            };
-            return Ok(result);
-        }
+            }
+            result = completion => {
+                result
+            }
+        }?;
+        return Ok(result);
     }
 
     /// Returns a sender object for this channel. The sender object can be

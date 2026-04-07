@@ -1,4 +1,4 @@
-use async_hybrid_fs::{Client, HybridFile, Permissions, UringCfg, UringTarget};
+use async_hybrid_fs::{Client, Permissions, UringCfg, UringTarget};
 use nix::fcntl::OFlag;
 use std::{
     io,
@@ -98,13 +98,11 @@ impl DevFuse {
             Client::build(UringCfg::default())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
         );
-        let file = client
+        let mut file = client
             .register_owned(fd)
             .map::<Box<dyn UringTarget + Send + Sync>, _>(|f| Box::new(f))
             .unwrap_or_else(|e| Box::new(e.1));
-        file.as_file_descriptor()
-            .hybrid_set_nonblocking(true)
-            .await?;
+        client.set_nonblocking(&mut file, true).await?;
         let file = AsyncFd::new(DevFuseTarget(file))?;
         Ok(Self { client, file })
     }

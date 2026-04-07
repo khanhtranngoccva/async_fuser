@@ -188,6 +188,7 @@ impl<FS: Filesystem> Session<FS> {
         let (file, mount) = Mount::new(mountpoint, &options.mount_options, options.acl).await?;
 
         let ch = Channel::new(file);
+        let token = CancellationToken::new();
 
         let mut session = Session {
             filesystem: FilesystemHolder {
@@ -201,7 +202,7 @@ impl<FS: Filesystem> Session<FS> {
             session_owner: geteuid(),
             proto_version: None,
             config: options.clone(),
-            cancellation_token: CancellationToken::new(),
+            cancellation_token: token,
         };
 
         session.handshake().await?;
@@ -238,11 +239,12 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the given session ends.
-    pub fn spawn(self) -> io::Result<BackgroundSession> {
+    pub fn spawn(mut self) -> io::Result<BackgroundSession> {
         let sender = self.ch.sender();
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *self.mount.mount.lock());
-        let cloned_token = self.cancellation_token.clone();
+        let cloned_token = self.cancellation_token;
+        self.cancellation_token = cloned_token.child_token();
         let guard = tokio::task::spawn(self.run());
         Ok(BackgroundSession {
             guard,
@@ -348,10 +350,11 @@ impl<FS: Filesystem> Session<FS> {
         let buf = buf.as_mut();
 
         loop {
+            let _ready_guard = self.ch.read_ready(&self.cancellation_token).await?;
             // Read the init request from the kernel
             let size = match self
                 .ch
-                .poll_and_receive(buf, &self.cancellation_token)
+                .receive_nonblocking(buf, &self.cancellation_token)
                 .await
             {
                 Ok(size) => size,
@@ -560,15 +563,37 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buf = FuseReadBuf::new();
         let buf = buf.as_mut();
-        loop {
+        'outer_loop: loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self
-                .ch
-                .poll_and_receive(buf, &self.cancellation_token)
-                .await
-            {
-                Ok(size) => match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
+            let _ready_guard = match self.ch.read_ready(&self.cancellation_token).await {
+                Ok(guard) => guard,
+                Err(err) if err.raw_os_error() == Some(Errno::ECANCELED.into()) => {
+                    return Ok(());
+                }
+                Err(err) => return Err(err.into()),
+            };
+            loop {
+                log::debug!("fetching nonblocking event");
+                let size = match self
+                    .ch
+                    .receive_nonblocking(buf, &self.cancellation_token)
+                    .await
+                {
+                    Ok(size) => size,
+                    // If the cancellation token is triggered, return Ok(()) immediately. FS destruction occurs later
+                    Err(err) if err.raw_os_error() == Some(Errno::ECANCELED.into()) => {
+                        return Ok(());
+                    }
+                    Err(err) if err.raw_os_error() == Some(Errno::EAGAIN.into()) => {
+                        // Need to go to outer loop to poll.
+                        continue 'outer_loop;
+                    }
+                    Err(err) if err.raw_os_error() == Some(ENODEV) => return Ok(()),
+                    Err(err) => return Err(err.into()),
+                };
+                log::debug!("received event of size {size}");
+                match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
                     Some(req) => {
                         if let Ok(Operation::Destroy(_)) = req.request.operation() {
@@ -585,11 +610,7 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                             "Invalid request",
                         ));
                     }
-                },
-                // If the cancellation token is triggered, return Ok(()) immediately. FS destruction occurs later
-                Err(err) if err.raw_os_error() == Some(Errno::ECANCELED.into()) => return Ok(()),
-                Err(err) if err.raw_os_error() == Some(ENODEV) => return Ok(()),
-                Err(err) => return Err(err.into()),
+                }
             }
         }
     }
@@ -627,6 +648,10 @@ impl BackgroundSession {
             }
         }
         self.cancellation_token.cancel();
+        log::debug!(
+            "background session token {:?} cancelled, waiting for thread",
+            self.cancellation_token
+        );
         self.guard
             .await
             .map_err(|e| (None, io::Error::new(io::ErrorKind::Other, e)))?
@@ -643,5 +668,39 @@ impl BackgroundSession {
         self.guard
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Config, Filesystem, Session};
+
+    struct DummyFS {}
+
+    impl Filesystem for DummyFS {}
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_session_lifecycle() {
+        // Create a temporary directory to mount the filesystem to
+        let temp_dir = tempdir::TempDir::new("test_session_lifecycle").unwrap();
+        let mount_point = temp_dir.path();
+
+        log::info!("creating session");
+
+        // Create a session
+        let session = Session::new(DummyFS {}, mount_point, &Config::default())
+            .await
+            .unwrap();
+
+        log::info!("initial session object created");
+
+        // Spawn the session
+        let bg_session = session.spawn().unwrap();
+
+        log::info!("background session thread spawned");
+
+        // Unmount the session
+        bg_session.umount_and_join(&[]).await.unwrap();
     }
 }

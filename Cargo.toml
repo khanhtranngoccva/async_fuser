@@ -23,7 +23,8 @@ xutex = { version = "0.2.1", features = ["std"] }
 bimap = "0.6.3"
 dashmap = "6.1.0"
 lazy_static = "1.5.0"
-async_hybrid_fs = { git = "https://github.com/khanhtranngoccva/async_hybrid_fs", rev = "06d123b04d5195ce934b9de953086e0414ed760b", version = "0.1.0" }
+# async_hybrid_fs = { git = "https://github.com/khanhtranngoccva/async_hybrid_fs", rev = "06d123b04d5195ce934b9de953086e0414ed760b", version = "0.1.0" }
+async_hybrid_fs = { path = "../async_hybrid_fs", version = "0.1.0" }
 instability = "0.3.12"
 async-scoped = { version = "0.9.0", features = ["use-tokio"] }
 futures = { version = "0.3.32", features = ["async-await"] }
@@ -40,3 +41,7 @@ macos-no-mount = []
 
 # Unstable features
 unstable-lookup-backing = []
+
+[dev-dependencies]
+tempdir = "0.3.7"
+test-log = "0.2.19"

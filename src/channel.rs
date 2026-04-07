@@ -1,4 +1,7 @@
-use crate::{dev_fuse::DevFuse, passthrough::BackingId};
+use tokio::io::Interest;
+use tokio_util::sync::CancellationToken;
+
+use crate::{Errno, dev_fuse::DevFuse, passthrough::BackingId};
 use std::{
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
@@ -23,31 +26,50 @@ impl AsRawFd for Channel {
 impl Channel {
     /// Initialize a new communication channel to the kernel driver using an existing
     /// `/dev/fuse` file descriptor. The kernel driver will delegate filesystem operations
-    /// to this channel.
+    /// to this channel. The device file descriptor must be nonblocking.
     pub(crate) fn new(device: Arc<DevFuse>) -> Self {
         Self(device)
     }
 
-    /// Receives data up to the capacity of the buffer.
-    async fn receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        let mut upgraded_target = unsafe { self.0.client.to_target(self.0.file.as_ref()) };
-        self.0.client.read(&mut upgraded_target, buffer).await
-    }
-
-    /// Receives data up to the capacity of the given buffer, retrying on errors that are safe to retry
-    /// ([`ENOENT`](libc::ENOENT), [`EAGAIN`](libc::EAGAIN), [`EINTR`](libc::EINTR)).
-    pub(crate) async fn receive_retrying(&self, buffer: &mut [u8]) -> io::Result<usize> {
+    /// Receives data up to the capacity of the buffer, and cancels upon triggering of the CancellationToken.
+    /// Retries on errors that are safe to retry ([`ENOENT`](libc::ENOENT), [`EAGAIN`](libc::EAGAIN), [`EINTR`](libc::EINTR)).
+    pub(crate) async fn poll_and_receive(
+        &self,
+        buffer: &mut [u8],
+        cancellation: &CancellationToken,
+    ) -> io::Result<usize> {
         loop {
-            match self.receive(buffer).await {
-                Ok(n) => return Ok(n),
-                Err(e) => {
-                    let raw_os_error = e.raw_os_error();
-                    match raw_os_error {
-                        Some(libc::ENOENT) | Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
-                        _ => return Err(e),
+            let _ready_guard = tokio::select! {
+                r = self.0.as_ref().ready(Interest::READABLE) => {
+                    r?
+                },
+                _ = cancellation.cancelled() => {
+                    return Err(io::Error::from_raw_os_error(Errno::ECANCELED.into()));
+                }
+            };
+            let mut upgraded_target = unsafe { self.0.client.to_target(self.0.as_ref()) };
+            let mut read_attempt = self.0.client.read(&mut upgraded_target, buffer);
+            let completion = read_attempt
+                .completion()
+                .expect("newly initialized pending IO operation must have a completion");
+            let result = match tokio::select! {
+                result = completion => {
+                    result
+                }
+                _ = cancellation.cancelled() => {
+                    match read_attempt.cancel().await {
+                        Some(result) => result,
+                        None => Err(io::Error::from_raw_os_error(Errno::ECANCELED.into())),
                     }
                 }
-            }
+            } {
+                Ok(result) => result,
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::ENOENT) | Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
+                    _ => return Err(e),
+                },
+            };
+            return Ok(result);
         }
     }
 
@@ -91,12 +113,14 @@ impl AsRawFd for ChannelSender {
 
 impl ChannelSender {
     pub(crate) async fn send(&self, buffers: &[io::IoSlice<'_>]) -> io::Result<()> {
-        let mut upgraded_target = unsafe { self.0.client.to_target(self.0.file.as_ref()) };
+        let mut upgraded_target = unsafe { self.0.client.to_target(self.0.as_ref()) };
         // SAFETY: parallel write to /dev/fuse is supported, and the target is not changed in the call.
         let rc = self
             .0
             .client
             .write_vectored(&mut upgraded_target, buffers)
+            .completion()
+            .expect("newly initialized pending IO operation must have a completion")
             .await?;
         // writev is atomic, so do not need to check how many bytes are written.
         // libfuse does not do it either

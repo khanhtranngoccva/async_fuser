@@ -1,4 +1,4 @@
-use async_hybrid_fs::{Client, Permissions, UringCfg, UringTarget};
+use async_hybrid_fs::{Client, HybridFile, Permissions, UringCfg, UringTarget};
 use nix::fcntl::OFlag;
 use std::{
     io,
@@ -6,12 +6,30 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     sync::Arc,
 };
+use tokio::io::unix::AsyncFd;
+
+// Use UringTarget to support both fixed targets and dynamic targets
+pub(crate) struct DevFuseTarget(Box<dyn UringTarget + Send + Sync>);
+
+impl AsRawFd for DevFuseTarget {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_file_descriptor().as_raw_fd()
+    }
+}
+
+impl Deref for DevFuseTarget {
+    type Target = dyn UringTarget + Send + Sync;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
 
 /// A newtype for [`File`] that represents the `/dev/fuse` device.
 pub(crate) struct DevFuse {
     pub(crate) client: Arc<Client>,
-    // Use UringTarget to support both fixed targets and dynamic targets
-    pub(crate) file: Box<dyn UringTarget + Send + Sync>,
+    // Wrap AsyncFd on top to allow polling for read readiness
+    pub(crate) file: AsyncFd<DevFuseTarget>,
 }
 
 impl std::fmt::Debug for DevFuse {
@@ -37,16 +55,16 @@ impl AsFd for DevFuse {
 }
 
 impl Deref for DevFuse {
-    type Target = dyn UringTarget + Send + Sync;
+    type Target = AsyncFd<DevFuseTarget>;
 
     fn deref(&self) -> &Self::Target {
-        self.file.as_ref()
+        &self.file
     }
 }
 
 impl DerefMut for DevFuse {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.file.as_mut()
+        &mut self.file
     }
 }
 
@@ -62,15 +80,16 @@ impl DevFuse {
         );
         let fuse = client
             .open_path(Self::PATH, OFlag::O_RDWR, Permissions::from_mode(0))
+            .completion()
+            .expect("failed to get completion")
             .await?;
-        let registered = client
+        let mut registered = client
             .register_owned(fuse)
             .map::<Box<dyn UringTarget + Send + Sync>, _>(|f| Box::new(f))
             .unwrap_or_else(|e| Box::new(e.1));
-        Ok(Self {
-            client,
-            file: registered,
-        })
+        client.set_nonblocking(&mut registered, true).await?;
+        let file = AsyncFd::new(DevFuseTarget(registered))?;
+        Ok(Self { client, file })
     }
 
     #[allow(dead_code)]
@@ -83,6 +102,10 @@ impl DevFuse {
             .register_owned(fd)
             .map::<Box<dyn UringTarget + Send + Sync>, _>(|f| Box::new(f))
             .unwrap_or_else(|e| Box::new(e.1));
+        file.as_file_descriptor()
+            .hybrid_set_nonblocking(true)
+            .await?;
+        let file = AsyncFd::new(DevFuseTarget(file))?;
         Ok(Self { client, file })
     }
 
@@ -92,6 +115,8 @@ impl DevFuse {
         let client = self.client.clone();
         let fuse = client
             .open_path(Self::PATH, OFlag::O_RDWR, Permissions::from_mode(0))
+            .completion()
+            .expect("failed to get completion")
             .await?;
         // SAFETY: fuse_dev_ioc_clone is a valid ioctl for /dev/fuse
         let target_fd_borrowed = fuse.as_fd();
@@ -111,13 +136,12 @@ impl DevFuse {
         .await;
         let future = futures.pop().expect("no future returned");
         future.expect("failed to join future")?;
-        let registered = client
+        let mut registered = client
             .register_owned(fuse)
             .map::<Box<dyn UringTarget + Send + Sync>, _>(|f| Box::new(f))
             .unwrap_or_else(|e| Box::new(e.1));
-        Ok(Self {
-            client,
-            file: registered,
-        })
+        client.set_nonblocking(&mut registered, true).await?;
+        let file = AsyncFd::new(DevFuseTarget(registered))?;
+        Ok(Self { client, file })
     }
 }

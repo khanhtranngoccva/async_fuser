@@ -15,6 +15,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use log::debug;
 use log::error;
@@ -152,6 +153,7 @@ pub struct Session<FS: Filesystem> {
     /// The field is set to `Some` when the init message is received.
     pub(crate) proto_version: Option<Version>,
     pub(crate) config: Config,
+    pub(crate) cancellation_token: CancellationToken,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -199,6 +201,7 @@ impl<FS: Filesystem> Session<FS> {
             session_owner: geteuid(),
             proto_version: None,
             config: options.clone(),
+            cancellation_token: CancellationToken::new(),
         };
 
         session.handshake().await?;
@@ -227,10 +230,9 @@ impl<FS: Filesystem> Session<FS> {
             session_owner: geteuid(),
             proto_version: None,
             config,
+            cancellation_token: CancellationToken::new(),
         };
-
         session.handshake().await?;
-
         Ok(session)
     }
 
@@ -240,11 +242,13 @@ impl<FS: Filesystem> Session<FS> {
         let sender = self.ch.sender();
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *self.mount.mount.lock());
+        let cloned_token = self.cancellation_token.clone();
         let guard = tokio::task::spawn(self.run());
         Ok(BackgroundSession {
             guard,
             sender,
             mount,
+            cancellation_token: cloned_token,
         })
     }
 
@@ -263,6 +267,7 @@ impl<FS: Filesystem> Session<FS> {
             session_owner,
             proto_version: _,
             config,
+            cancellation_token,
         } = self;
 
         let n_tasks = config.n_tasks.unwrap_or(1);
@@ -295,8 +300,7 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
         channels.push(primary_channel);
-
-        let mut threads = Vec::with_capacity(n_tasks);
+        let mut tasks = Vec::with_capacity(n_tasks);
 
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = format!("fuser-{i}");
@@ -306,14 +310,15 @@ impl<FS: Filesystem> Session<FS> {
                 ch,
                 allowed,
                 session_owner,
+                cancellation_token: cancellation_token.child_token(),
             };
-            threads.push(tokio::task::spawn(
+            tasks.push(tokio::task::spawn(
                 async move { event_loop.event_loop().await },
             ));
         }
 
         let mut reply: io::Result<()> = Ok(());
-        for thread in threads {
+        for thread in tasks {
             let res = match thread.await {
                 Ok(res) => res,
                 Err(_) => {
@@ -344,7 +349,11 @@ impl<FS: Filesystem> Session<FS> {
 
         loop {
             // Read the init request from the kernel
-            let size = match self.ch.receive_retrying(buf).await {
+            let size = match self
+                .ch
+                .poll_and_receive(buf, &self.cancellation_token)
+                .await
+            {
                 Ok(size) => size,
                 Err(err) if err.raw_os_error() == Some(ENODEV) => {
                     return Err(io::Error::new(
@@ -354,7 +363,6 @@ impl<FS: Filesystem> Session<FS> {
                 }
                 Err(err) => return Err(err.into()),
             };
-
             // Parse the request
             let request = match ll::AnyRequest::try_from(&buf[..size]) {
                 Ok(request) => request,
@@ -363,7 +371,6 @@ impl<FS: Filesystem> Session<FS> {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
                 }
             };
-
             // Extract the init operation
             let op = match request.operation() {
                 Ok(op) => op,
@@ -544,6 +551,7 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) filesystem: Arc<FilesystemHolder<FS>>,
     pub(crate) allowed: SessionACL,
     pub(crate) session_owner: Uid,
+    pub(crate) cancellation_token: CancellationToken,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
@@ -555,7 +563,11 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive_retrying(buf).await {
+            match self
+                .ch
+                .poll_and_receive(buf, &self.cancellation_token)
+                .await
+            {
                 Ok(size) => match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
                     Some(req) => {
@@ -574,6 +586,8 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                         ));
                     }
                 },
+                // If the cancellation token is triggered, return Ok(()) immediately. FS destruction occurs later
+                Err(err) if err.raw_os_error() == Some(Errno::ECANCELED.into()) => return Ok(()),
                 Err(err) if err.raw_os_error() == Some(ENODEV) => return Ok(()),
                 Err(err) => return Err(err.into()),
             }
@@ -590,6 +604,8 @@ pub struct BackgroundSession {
     sender: ChannelSender,
     /// Ensures the filesystem is unmounted when the session ends
     mount: Option<Mount>,
+    /// CancellationToken for the background session
+    cancellation_token: CancellationToken,
 }
 
 impl BackgroundSession {
@@ -610,6 +626,7 @@ impl BackgroundSession {
                 }
             }
         }
+        self.cancellation_token.cancel();
         self.guard
             .await
             .map_err(|e| (None, io::Error::new(io::ErrorKind::Other, e)))?

@@ -15,6 +15,6 @@ where
                 .unwrap()
         })
     } else {
-        tokio::task::block_in_place(|| backup_runtime.block_on(future))
+        tokio::task::block_in_place(move || backup_runtime.block_on(future))
     }
 }

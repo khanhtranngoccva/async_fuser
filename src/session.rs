@@ -49,6 +49,7 @@ use crate::reply::Reply;
 use crate::reply::ReplyRaw;
 use crate::reply::ReplySender;
 use crate::request::RequestWithSender;
+use crate::runtime::DroppableRuntime;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -144,9 +145,6 @@ pub struct Session<FS: Filesystem> {
     pub(crate) ch: Channel,
     /// Handle to the mount.  Dropping this unmounts.
     mount: UmountOnDrop,
-    /// Whether to restrict access to owner, root + owner, or unrestricted
-    /// Used to implement `allow_root` and `auto_unmount`
-    pub(crate) allowed: SessionACL,
     /// User that launched the fuser process
     pub(crate) session_owner: Uid,
     /// FUSE protocol version, as reported by the kernel.
@@ -198,7 +196,6 @@ impl<FS: Filesystem> Session<FS> {
             mount: UmountOnDrop {
                 mount: Arc::new(Mutex::new(Some(mount))),
             },
-            allowed: options.acl,
             session_owner: geteuid(),
             proto_version: None,
             config: options.clone(),
@@ -212,12 +209,7 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Wrap an existing /dev/fuse file descriptor. This doesn't mount the
     /// filesystem anywhere; that must be done separately.
-    pub async fn from_fd(
-        filesystem: FS,
-        fd: OwnedFd,
-        acl: SessionACL,
-        config: Config,
-    ) -> io::Result<Self> {
+    pub async fn from_fd(filesystem: FS, fd: OwnedFd, config: Config) -> io::Result<Self> {
         let ch = Channel::new(Arc::new(DevFuse::try_from_fd(fd).await?));
         let mut session = Session {
             filesystem: FilesystemHolder {
@@ -227,7 +219,6 @@ impl<FS: Filesystem> Session<FS> {
             mount: UmountOnDrop {
                 mount: Arc::new(Mutex::new(None)),
             },
-            allowed: acl,
             session_owner: geteuid(),
             proto_version: None,
             config,
@@ -245,11 +236,13 @@ impl<FS: Filesystem> Session<FS> {
         let mount = std::mem::take(&mut *self.mount.mount.lock());
         let cloned_token = self.cancellation_token;
         self.cancellation_token = cloned_token.child_token();
-        let guard = tokio::task::spawn(self.run());
+        let host_runtime = DroppableRuntime::new(1);
+        let guard = host_runtime.spawn(self.run());
         Ok(BackgroundSession {
             guard,
             sender,
             mount,
+            _runtime: host_runtime,
             _cancellation_token: cloned_token,
         })
     }
@@ -265,26 +258,27 @@ impl<FS: Filesystem> Session<FS> {
             filesystem,
             ch: primary_channel,
             mount: _do_not_umount_yet,
-            allowed,
             session_owner,
             proto_version: _,
             config,
             cancellation_token,
         } = self;
 
-        let n_tasks = config.n_tasks.unwrap_or(1);
+        let n_event_loop_workers = config.n_event_loop_workers.unwrap_or(1);
+        let n_handler_workers = config.n_handler_workers.unwrap_or(1);
+        let runtime = DroppableRuntime::new(n_event_loop_workers + n_handler_workers);
 
-        if !cfg!(target_os = "linux") && n_tasks != 1 {
+        if !cfg!(target_os = "linux") && n_event_loop_workers != 1 {
             // TODO: check whether it works on macOS/FreeBSD and enable if it works.
             return Err(io::Error::other("n_tasks != 1 is only supported on Linux"));
         }
 
-        let Some(n_tasks_minus_one) = n_tasks.checked_sub(1) else {
+        let Some(n_tasks_minus_one) = n_event_loop_workers.checked_sub(1) else {
             return Err(io::Error::other("n_tasks"));
         };
 
         let mut filesystem = Arc::new(filesystem);
-        let mut channels = Vec::with_capacity(n_tasks);
+        let mut channels = Vec::with_capacity(n_event_loop_workers);
 
         for _ in 0..n_tasks_minus_one {
             if config.clone_fd {
@@ -302,7 +296,7 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
         channels.push(primary_channel);
-        let mut tasks = Vec::with_capacity(n_tasks);
+        let mut tasks = Vec::with_capacity(n_event_loop_workers);
 
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = format!("fuser-{i}");
@@ -310,13 +304,11 @@ impl<FS: Filesystem> Session<FS> {
                 thread_name: thread_name.clone(),
                 filesystem: filesystem.clone(),
                 ch,
-                allowed,
+                allowed: config.acl,
                 session_owner,
                 cancellation_token: cancellation_token.child_token(),
             };
-            tasks.push(tokio::task::spawn(
-                async move { event_loop.event_loop().await },
-            ));
+            tasks.push(runtime.spawn(async move { event_loop.event_loop().await }));
         }
 
         let mut reply: io::Result<()> = Ok(());
@@ -619,6 +611,8 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
 pub struct BackgroundSession {
     /// Thread guard of the background session
     pub guard: JoinHandle<io::Result<()>>,
+    /// Runtime for the background session, which hosts a single task that runs the session loop.
+    _runtime: DroppableRuntime,
     /// Object for creating Notifiers for client use
     sender: ChannelSender,
     /// Ensures the filesystem is unmounted when the session ends
@@ -666,7 +660,7 @@ impl BackgroundSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, Filesystem, Session};
+    use crate::{Config, Filesystem, Session, runtime};
 
     struct DummyFS {}
 
@@ -689,5 +683,24 @@ mod tests {
 
         // Unmount the session
         bg_session.umount_and_join(&[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_session_lifecycle_with_sync_drop() {
+        // Create a temporary directory to mount the filesystem to
+        let temp_dir = tempdir::TempDir::new("test_session_lifecycle").unwrap();
+        let mount_point = temp_dir.path();
+
+        // Create a session
+        let session = Session::new(DummyFS {}, mount_point, &Config::default())
+            .await
+            .unwrap();
+
+        // Spawn the background session
+        let bg_session = session.spawn().unwrap();
+
+        // Unmount the session using sync mode in a current thread runtime to simulate the function being called from a Drop impl, should not deadlock with internal tasks
+        runtime::execute_future_from_sync(bg_session.umount_and_join(&[])).unwrap();
     }
 }

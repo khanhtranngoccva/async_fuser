@@ -118,6 +118,7 @@ dependencies = [
 [[package]]
 name = "async_hybrid_fs"
 version = "0.1.0"
+source = "git+https://github.com/khanhtranngoccva/async_hybrid_fs?rev=9c37e89f01f203cc7de9175c9db72a9cc3b63f6b#9c37e89f01f203cc7de9175c9db72a9cc3b63f6b"
 dependencies = [
  "async-scoped",
  "async-trait",

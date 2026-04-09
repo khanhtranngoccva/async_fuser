@@ -2,22 +2,33 @@ use std::ops::{Deref, DerefMut};
 
 use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 
-/// Attempts to execute a future on a temporary runtime (based on async_scoped's TokioScope implementation).
 pub(crate) fn execute_future_from_sync<F>(future: F) -> F::Output
 where
     F::Output: Send,
     F: Future + Send,
 {
-    let handle_flavor = Handle::try_current().ok().map(|r| r.runtime_flavor());
-    let backup_runtime = Builder::new_current_thread().enable_all().build().unwrap();
-    if let Some(RuntimeFlavor::CurrentThread) = handle_flavor {
-        std::thread::scope(|s| {
-            s.spawn(move || backup_runtime.block_on(future))
+    let handle = Handle::try_current().ok();
+    match handle {
+        Some(handle) => match handle.runtime_flavor() {
+            RuntimeFlavor::CurrentThread => std::thread::scope(|s| {
+                s.spawn(move || {
+                    let backup_runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+                    backup_runtime.block_on(future)
+                })
                 .join()
                 .unwrap()
-        })
-    } else {
-        tokio::task::block_in_place(move || backup_runtime.block_on(future))
+            }),
+            RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(move || handle.block_on(future))
+            }
+            _ => {
+                unreachable!("Unsupported runtime flavor: {:?}", handle.runtime_flavor())
+            }
+        },
+        None => {
+            let backup_runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+            tokio::task::block_in_place(move || backup_runtime.block_on(future))
+        }
     }
 }
 

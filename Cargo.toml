@@ -23,7 +23,7 @@ xutex = { version = "0.2.1", features = ["std"] }
 bimap = "0.6.3"
 dashmap = "6.1.0"
 lazy_static = "1.5.0"
-async_hybrid_fs = { git = "https://github.com/khanhtranngoccva/async_hybrid_fs", rev = "6f60acb69ca71eddb1aad3191a2c6d5258b6750d", version = "0.1.0" }
+async_hybrid_fs = { git = "https://github.com/khanhtranngoccva/async_hybrid_fs", rev = "f1e1128f9071e96ff6f28459c2310a0f36ccf3b5", version = "0.1.0" }
 instability = "0.3.12"
 async-scoped = { version = "0.9.0", features = ["use-tokio"] }
 futures = { version = "0.3.32", features = ["async-await"] }

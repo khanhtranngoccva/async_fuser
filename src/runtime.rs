@@ -95,6 +95,7 @@ impl DerefMut for DroppableRuntime {
 }
 
 /// Custom cluster of Tokio runtimes that helps with reducing contention on certain shared runtime states.
+#[allow(unused)]
 pub(crate) struct DroppableRuntimeCluster {
     shards: Vec<DroppableRuntime>,
     worker_threads: usize,
@@ -102,6 +103,7 @@ pub(crate) struct DroppableRuntimeCluster {
     counter: AtomicUsize,
 }
 
+#[allow(unused)]
 impl DroppableRuntimeCluster {
     pub(crate) fn new(
         worker_name: &str,

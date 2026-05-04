@@ -53,7 +53,6 @@ use crate::reply::ReplySender;
 use crate::request::RequestWithSender;
 use crate::runtime;
 use crate::runtime::DroppableRuntime;
-use crate::runtime::DroppableRuntimeCluster;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS

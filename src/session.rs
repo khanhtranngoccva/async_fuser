@@ -9,6 +9,7 @@ use libc::ENODEV;
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
+use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
@@ -16,6 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use log::debug;
 use log::error;
@@ -49,7 +51,9 @@ use crate::reply::Reply;
 use crate::reply::ReplyRaw;
 use crate::reply::ReplySender;
 use crate::request::RequestWithSender;
+use crate::runtime;
 use crate::runtime::DroppableRuntime;
+use crate::runtime::DroppableRuntimeCluster;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -88,9 +92,15 @@ pub(crate) struct FilesystemHolder<FS: Filesystem> {
 }
 
 impl<FS: Filesystem> FilesystemHolder<FS> {
+    pub(crate) fn new(fs: FS) -> Self {
+        Self { fs: Some(fs) }
+    }
+}
+
+impl<FS: Filesystem> FilesystemHolder<FS> {
     fn destroy(&mut self) {
         if let Some(mut fs) = self.fs.take() {
-            tokio::spawn(async move { fs.destroy().await });
+            runtime::execute_future_from_sync(async move { fs.destroy().await });
         }
     }
 }
@@ -98,6 +108,14 @@ impl<FS: Filesystem> FilesystemHolder<FS> {
 impl<FS: Filesystem> Drop for FilesystemHolder<FS> {
     fn drop(&mut self) {
         self.destroy();
+    }
+}
+
+impl<FS: Filesystem> Deref for FilesystemHolder<FS> {
+    type Target = FS;
+
+    fn deref(&self) -> &Self::Target {
+        self.fs.as_ref().expect("filesystem must be initialized")
     }
 }
 
@@ -170,7 +188,22 @@ impl<FS: Filesystem> Session<FS> {
         options: &Config,
     ) -> io::Result<Session<FS>> {
         check_option_conflicts(options)?;
-
+        if let Some(n_handler_workers) = options.n_handler_workers {
+            if n_handler_workers == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "n_handler_workers must be greater than 0",
+                ));
+            }
+        }
+        if let Some(n_event_loop_workers) = options.n_event_loop_workers {
+            if n_event_loop_workers == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "n_event_loop_workers must be greater than 0",
+                ));
+            }
+        }
         let mountpoint = mountpoint.as_ref();
         info!("Mounting {}", mountpoint.display());
         // If AutoUnmount is requested, but not AllowRoot or AllowOther, return an error
@@ -189,9 +222,7 @@ impl<FS: Filesystem> Session<FS> {
         let token = CancellationToken::new();
 
         let mut session = Session {
-            filesystem: FilesystemHolder {
-                fs: Some(filesystem),
-            },
+            filesystem: FilesystemHolder::new(filesystem),
             ch,
             mount: UmountOnDrop {
                 mount: Arc::new(Mutex::new(Some(mount))),
@@ -210,11 +241,25 @@ impl<FS: Filesystem> Session<FS> {
     /// Wrap an existing /dev/fuse file descriptor. This doesn't mount the
     /// filesystem anywhere; that must be done separately.
     pub async fn from_fd(filesystem: FS, fd: OwnedFd, config: Config) -> io::Result<Self> {
+        if let Some(n_handler_workers) = config.n_handler_workers {
+            if n_handler_workers == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "n_handler_workers must be greater than 0",
+                ));
+            }
+        }
+        if let Some(n_event_loop_workers) = config.n_event_loop_workers {
+            if n_event_loop_workers == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "n_event_loop_workers must be greater than 0",
+                ));
+            }
+        }
         let ch = Channel::new(Arc::new(DevFuse::try_from_fd(fd).await?));
         let mut session = Session {
-            filesystem: FilesystemHolder {
-                fs: Some(filesystem),
-            },
+            filesystem: FilesystemHolder::new(filesystem),
             ch,
             mount: UmountOnDrop {
                 mount: Arc::new(Mutex::new(None)),
@@ -236,8 +281,8 @@ impl<FS: Filesystem> Session<FS> {
         let mount = std::mem::take(&mut *self.mount.mount.lock());
         let cloned_token = self.cancellation_token;
         self.cancellation_token = cloned_token.child_token();
-        let host_runtime = DroppableRuntime::new(1);
-        let guard = host_runtime.spawn(self.run());
+        let host_runtime = DroppableRuntime::new("afuser-tmp", 1, false)?;
+        let guard = host_runtime.spawn(self.run_internal());
         Ok(BackgroundSession {
             guard,
             sender,
@@ -247,13 +292,8 @@ impl<FS: Filesystem> Session<FS> {
         })
     }
 
-    /// Run the session loop that receives kernel requests and dispatches them to method
-    /// calls into the filesystem. This read-dispatch-loop is non-concurrent to prevent
-    /// having multiple buffers (which take up much memory), but the filesystem methods
-    /// may run concurrent by spawning threads.
-    /// # Errors
-    /// Returns any final error when the session comes to an end.
-    pub async fn run(self) -> io::Result<()> {
+    /// Internal method for running the session loop. This may not be called directly, since it does not create a temporary runtime to run blocking code.
+    async fn run_internal(self) -> io::Result<()> {
         let Session {
             filesystem,
             ch: primary_channel,
@@ -266,7 +306,18 @@ impl<FS: Filesystem> Session<FS> {
 
         let n_event_loop_workers = config.n_event_loop_workers.unwrap_or(1);
         let n_handler_workers = config.n_handler_workers.unwrap_or(1);
-        let runtime = DroppableRuntime::new(n_event_loop_workers + n_handler_workers);
+        let event_loop_runtime = DroppableRuntime::new("afuser-evt", n_event_loop_workers, true)?;
+        let handler_runtime = Arc::new(DroppableRuntime::new(
+            "afuser-hnd",
+            n_handler_workers,
+            true,
+        )?);
+        log::info!(
+            "Spawning FUSE session with {} event loop workers and {} handler workers",
+            n_event_loop_workers,
+            n_handler_workers
+        );
+        let task_tracker = TaskTracker::new();
 
         if !cfg!(target_os = "linux") && n_event_loop_workers != 1 {
             // TODO: check whether it works on macOS/FreeBSD and enable if it works.
@@ -307,8 +358,10 @@ impl<FS: Filesystem> Session<FS> {
                 allowed: config.acl,
                 session_owner,
                 cancellation_token: cancellation_token.child_token(),
+                handler_runtime: handler_runtime.clone(),
+                task_tracker: task_tracker.clone(),
             };
-            tasks.push(runtime.spawn(async move { event_loop.event_loop().await }));
+            tasks.push(event_loop_runtime.spawn(async move { event_loop.event_loop().await }));
         }
 
         let mut reply: io::Result<()> = Ok(());
@@ -326,6 +379,12 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
 
+        // Wait until all tasks spawned by the event loop and handler runtime are completed.
+        task_tracker.close();
+        task_tracker.wait().await;
+        drop(handler_runtime);
+        drop(event_loop_runtime);
+
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
             return Err(io::Error::other(
                 "BUG: must have one refcount for filesystem",
@@ -335,6 +394,17 @@ impl<FS: Filesystem> Session<FS> {
         filesystem.destroy();
 
         reply
+    }
+
+    /// Run the session loop that receives kernel requests and dispatches them to method calls into the filesystem.
+    ///
+    /// Since the method may synchronously block waiting for outstanding event loop and handler tasks to complete, a temporary multithreaded runtime is created exclusively to spawn a task for running this method (i.e. an independent thread but awaitable).
+    ///
+    /// # Errors
+    /// Returns any final error when the session comes to an end.
+    pub async fn run(self) -> io::Result<()> {
+        let host_runtime = DroppableRuntime::new("afuser-tmp", 1, false)?;
+        host_runtime.spawn(self.run_internal()).await?
     }
 
     async fn handshake(&mut self) -> io::Result<()> {
@@ -547,6 +617,8 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) allowed: SessionACL,
     pub(crate) session_owner: Uid,
     pub(crate) cancellation_token: CancellationToken,
+    pub(crate) handler_runtime: Arc<DroppableRuntime>,
+    pub(crate) task_tracker: TaskTracker,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {

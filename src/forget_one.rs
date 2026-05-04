@@ -23,8 +23,20 @@ impl ForgetOne {
         self.forget_one.nlookup
     }
 
+    #[allow(unused)]
     pub(crate) fn slice_from_inner(inner: &[fuse_forget_one]) -> &[Self] {
         // SAFETY: repr(transparent).
         unsafe { mem::transmute(inner) }
+    }
+
+    pub(crate) fn vec_from_inner(inner: &[fuse_forget_one]) -> Vec<Self> {
+        let mut output = Vec::with_capacity(inner.len());
+        output.extend(inner.iter().map(|f| Self {
+            forget_one: fuse_forget_one {
+                nlookup: f.nlookup,
+                nodeid: f.nodeid,
+            },
+        }));
+        output
     }
 }

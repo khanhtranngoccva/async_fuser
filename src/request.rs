@@ -6,7 +6,6 @@
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
 use std::convert::TryFrom;
-use std::path::Path;
 
 use log::debug;
 use log::error;
@@ -101,11 +100,9 @@ impl<'a> RequestWithSender<'a> {
             }
         }
 
-        let Some(filesystem) = &se.filesystem.fs else {
-            // This is handled before dispatch call.
-            error!("bug: filesystem must be initialized in dispatch_req");
-            return Err(Errno::EIO);
-        };
+        let header = self.request_header().clone();
+        let nodeid = self.request.nodeid();
+        let filesystem = se.filesystem.clone();
 
         match op {
             // Filesystem initialization - should not happen after handshake completed
@@ -117,520 +114,589 @@ impl<'a> RequestWithSender<'a> {
                 // This is handled before dispatch call.
                 return Err(Errno::EIO);
             }
-
             ll::Operation::Interrupt(_) => {
                 // TODO: handle FUSE_INTERRUPT
                 return Err(Errno::ENOSYS);
             }
-
             ll::Operation::Lookup(x) => {
-                filesystem
-                    .lookup(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name().as_ref(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().as_os_str().to_os_string();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.lookup(&header, nodeid, &name, reply).await;
+                    }));
             }
             ll::Operation::Forget(x) => {
-                filesystem
-                    .forget(self.request_header(), self.request.nodeid(), x.nlookup())
-                    .await; // no reply
+                let nlookup = x.nlookup();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.forget(&header, nodeid, nlookup).await;
+                    }));
             }
             ll::Operation::GetAttr(_attr) => {
-                filesystem
-                    .getattr(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        _attr.file_handle(),
-                        self.reply(),
-                    )
-                    .await;
+                let fh = _attr.file_handle();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.getattr(&header, nodeid, fh, reply).await;
+                    }));
             }
             ll::Operation::SetAttr(x) => {
-                filesystem
-                    .setattr(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.mode(),
-                        x.uid(),
-                        x.gid(),
-                        x.size(),
-                        x.atime(),
-                        x.mtime(),
-                        x.ctime(),
-                        x.file_handle(),
-                        x.crtime(),
-                        x.chgtime(),
-                        x.bkuptime(),
-                        x.flags(),
-                        self.reply(),
-                    )
-                    .await;
+                let mode = x.mode();
+                let uid = x.uid();
+                let gid = x.gid();
+                let size = x.size();
+                let atime = x.atime();
+                let mtime = x.mtime();
+                let ctime = x.ctime();
+                let fh = x.file_handle();
+                let crtime = x.crtime();
+                let chgtime = x.chgtime();
+                let bkuptime = x.bkuptime();
+                let flags = x.flags();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .setattr(
+                                &header, nodeid, mode, uid, gid, size, atime, mtime, ctime, fh,
+                                crtime, chgtime, bkuptime, flags, reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::ReadLink(_) => {
-                filesystem
-                    .readlink(self.request_header(), self.request.nodeid(), self.reply())
-                    .await;
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.readlink(&header, nodeid, reply).await;
+                    }));
             }
             ll::Operation::MkNod(x) => {
-                filesystem
-                    .mknod(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name().as_ref(),
-                        x.mode(),
-                        x.umask(),
-                        x.rdev(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().as_os_str().to_os_string();
+                let mode = x.mode();
+                let umask = x.umask();
+                let rdev = x.rdev();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .mknod(&header, nodeid, &name, mode, umask, rdev, reply)
+                            .await;
+                    }));
             }
             ll::Operation::MkDir(x) => {
-                filesystem
-                    .mkdir(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name().as_ref(),
-                        x.mode(),
-                        x.umask(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().as_os_str().to_os_string();
+                let mode = x.mode();
+                let umask = x.umask();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .mkdir(&header, nodeid, &name, mode, umask, reply)
+                            .await;
+                    }));
             }
             ll::Operation::Unlink(x) => {
-                filesystem
-                    .unlink(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name().as_ref(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().as_os_str().to_os_string();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.unlink(&header, nodeid, &name, reply).await;
+                    }));
             }
             ll::Operation::RmDir(x) => {
-                filesystem
-                    .rmdir(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name().as_ref(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().as_os_str().to_os_string();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.rmdir(&header, nodeid, &name, reply).await;
+                    }));
             }
             ll::Operation::SymLink(x) => {
-                filesystem
-                    .symlink(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.link_name().as_ref(),
-                        Path::new(x.target()),
-                        self.reply(),
-                    )
-                    .await;
+                let link_name = x.link_name().as_os_str().to_os_string();
+                let target = x.target().to_owned();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .symlink(&header, nodeid, &link_name, &target, reply)
+                            .await;
+                    }));
             }
             ll::Operation::Rename(x) => {
-                filesystem
-                    .rename(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.src().name.as_ref(),
-                        x.dest().dir,
-                        x.dest().name.as_ref(),
-                        RenameFlags::empty(),
-                        self.reply(),
-                    )
-                    .await;
+                let src_name = x.src().name.as_os_str().to_os_string();
+                let dest_dir = x.dest().dir;
+                let dest_name = x.dest().name.as_os_str().to_os_string();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .rename(
+                                &header,
+                                nodeid,
+                                &src_name,
+                                dest_dir,
+                                &dest_name,
+                                RenameFlags::empty(),
+                                reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::Link(x) => {
-                filesystem
-                    .link(
-                        self.request_header(),
-                        x.inode_no(),
-                        self.request.nodeid(),
-                        x.dest().name.as_ref(),
-                        self.reply(),
-                    )
-                    .await;
+                let inode_no = x.inode_no();
+                let dest_name = x.dest().name.as_os_str().to_os_string();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .link(&header, inode_no, nodeid, &dest_name, reply)
+                            .await;
+                    }));
             }
             ll::Operation::Open(x) => {
-                filesystem
-                    .open(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.flags(),
-                        self.reply(),
-                    )
-                    .await;
+                let flags = x.flags();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.open(&header, nodeid, flags, reply).await;
+                    }));
             }
             ll::Operation::Read(x) => {
-                filesystem
-                    .read(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.offset()?,
-                        x.size(),
-                        x.flags(),
-                        x.lock_owner(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let offset = x.offset()?;
+                let size = x.size();
+                let flags = x.flags();
+                let lock_owner = x.lock_owner();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .read(
+                                &header,
+                                nodeid,
+                                file_handle,
+                                offset,
+                                size,
+                                flags,
+                                lock_owner,
+                                reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::Write(x) => {
-                filesystem
-                    .write(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.offset()?,
-                        x.data(),
-                        x.write_flags(),
-                        x.flags(),
-                        x.lock_owner(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let offset = x.offset()?;
+                // TODO: an extra allocate and copy is required to free the event loop buffer for reading subsequent requests, consider using a bucketed buffer pool to eliminate allocations
+                let data = x.data().to_vec();
+                let write_flags = x.write_flags();
+                let flags = x.flags();
+                let lock_owner = x.lock_owner();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .write(
+                                &header,
+                                nodeid,
+                                file_handle,
+                                offset,
+                                &data,
+                                write_flags,
+                                flags,
+                                lock_owner,
+                                reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::Flush(x) => {
-                filesystem
-                    .flush(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.lock_owner(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let lock_owner = x.lock_owner();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .flush(&header, nodeid, file_handle, lock_owner, reply)
+                            .await;
+                    }));
             }
             ll::Operation::Release(x) => {
-                filesystem
-                    .release(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.flags(),
-                        x.lock_owner(),
-                        x.flush(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let flags = x.flags();
+                let lock_owner = x.lock_owner();
+                let flush = x.flush();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .release(
+                                &header,
+                                nodeid,
+                                file_handle,
+                                flags,
+                                lock_owner,
+                                flush,
+                                reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::FSync(x) => {
-                filesystem
-                    .fsync(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.fdatasync(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let datasync = x.fdatasync();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .fsync(&header, nodeid, file_handle, datasync, reply)
+                            .await;
+                    }));
             }
             ll::Operation::OpenDir(x) => {
-                filesystem
-                    .opendir(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.flags(),
-                        self.reply(),
-                    )
-                    .await;
+                let flags = x.flags();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.opendir(&header, nodeid, flags, reply).await;
+                    }));
             }
             ll::Operation::ReadDir(x) => {
-                filesystem
-                    .readdir(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.offset(),
-                        ReplyDirectory::new(
-                            self.request.unique(),
-                            ReplySender::Channel(self.ch.clone()),
-                            x.size() as usize,
-                        ),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let offset = x.offset();
+                let reply = ReplyDirectory::new(
+                    self.request.unique(),
+                    ReplySender::Channel(self.ch.clone()),
+                    x.size() as usize,
+                );
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .readdir(&header, nodeid, file_handle, offset, reply)
+                            .await;
+                    }));
             }
             ll::Operation::ReleaseDir(x) => {
-                filesystem
-                    .releasedir(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.flags(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let flags = x.flags();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .releasedir(&header, nodeid, file_handle, flags, reply)
+                            .await;
+                    }));
             }
             ll::Operation::FSyncDir(x) => {
-                filesystem
-                    .fsyncdir(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.fdatasync(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let datasync = x.fdatasync();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .fsyncdir(&header, nodeid, file_handle, datasync, reply)
+                            .await;
+                    }));
             }
             ll::Operation::StatFs(_) => {
-                filesystem
-                    .statfs(self.request_header(), self.request.nodeid(), self.reply())
-                    .await;
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.statfs(&header, nodeid, reply).await;
+                    }));
             }
             ll::Operation::SetXAttr(x) => {
-                filesystem
-                    .setxattr(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name(),
-                        x.value(),
-                        x.flags(),
-                        x.position(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().to_os_string();
+                // TODO: consider using a buffer pool
+                let value = x.value().to_vec();
+                let flags = x.flags();
+                let position = x.position();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .setxattr(&header, nodeid, &name, &value, flags, position, reply)
+                            .await;
+                    }));
             }
             ll::Operation::GetXAttr(x) => {
-                filesystem
-                    .getxattr(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name(),
-                        x.size_u32(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().to_os_string();
+                let size = x.size_u32();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .getxattr(&header, nodeid, &name, size, reply)
+                            .await;
+                    }));
             }
             ll::Operation::ListXAttr(x) => {
-                filesystem
-                    .listxattr(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.size(),
-                        self.reply(),
-                    )
-                    .await;
+                let size = x.size();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.listxattr(&header, nodeid, size, reply).await;
+                    }));
             }
             ll::Operation::RemoveXAttr(x) => {
-                filesystem
-                    .removexattr(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().to_os_string();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.removexattr(&header, nodeid, &name, reply).await;
+                    }));
             }
             ll::Operation::Access(x) => {
-                filesystem
-                    .access(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.mask(),
-                        self.reply(),
-                    )
-                    .await;
+                let mask = x.mask();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.access(&header, nodeid, mask, reply).await;
+                    }));
             }
             ll::Operation::Create(x) => {
-                filesystem
-                    .create(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.name().as_ref(),
-                        x.mode(),
-                        x.umask(),
-                        x.flags(),
-                        self.reply(),
-                    )
-                    .await;
+                let name = x.name().as_os_str().to_os_string();
+                let mode = x.mode();
+                let umask = x.umask();
+                let flags = x.flags();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .create(&header, nodeid, &name, mode, umask, flags, reply)
+                            .await;
+                    }));
             }
             ll::Operation::GetLk(x) => {
-                filesystem
-                    .getlk(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.lock_owner(),
-                        x.lock().range.0,
-                        x.lock().range.1,
-                        x.lock().typ,
-                        x.lock().pid,
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let lock_owner = x.lock_owner();
+                let start = x.lock().range.0;
+                let end = x.lock().range.1;
+                let typ = x.lock().typ;
+                let pid = x.lock().pid;
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .getlk(
+                                &header,
+                                nodeid,
+                                file_handle,
+                                lock_owner,
+                                start,
+                                end,
+                                typ,
+                                pid,
+                                reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::SetLk(x) => {
-                filesystem
-                    .setlk(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.lock_owner(),
-                        x.lock().range.0,
-                        x.lock().range.1,
-                        x.lock().typ,
-                        x.lock().pid,
-                        x.sleep(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let lock_owner = x.lock_owner();
+                let start = x.lock().range.0;
+                let end = x.lock().range.1;
+                let typ = x.lock().typ;
+                let pid = x.lock().pid;
+                let sleep = x.sleep();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .setlk(
+                                &header,
+                                nodeid,
+                                file_handle,
+                                lock_owner,
+                                start,
+                                end,
+                                typ,
+                                pid,
+                                sleep,
+                                reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::BMap(x) => {
-                filesystem
-                    .bmap(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.block_size(),
-                        x.block(),
-                        self.reply(),
-                    )
-                    .await;
+                let block_size = x.block_size();
+                let block = x.block();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .bmap(&header, nodeid, block_size, block, reply)
+                            .await;
+                    }));
             }
-
             ll::Operation::IoCtl(x) => {
                 if x.unrestricted() {
                     return Err(Errno::ENOSYS);
                 }
-                filesystem
-                    .ioctl(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.flags(),
-                        x.command(),
-                        x.in_data(),
-                        x.out_size(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let flags = x.flags();
+                let command = x.command();
+                // TODO: consider using a buffer pool
+                let in_data = x.in_data().to_vec();
+                let out_size = x.out_size();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .ioctl(
+                                &header,
+                                nodeid,
+                                file_handle,
+                                flags,
+                                command,
+                                &in_data,
+                                out_size,
+                                reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::Poll(x) => {
+                let file_handle = x.file_handle();
                 let ph = PollNotifier::new(se.ch.sender(), x.kernel_handle());
-
-                filesystem
-                    .poll(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        ph,
-                        x.events(),
-                        x.flags(),
-                        self.reply(),
-                    )
-                    .await;
+                let events = x.events();
+                let flags = x.flags();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .poll(&header, nodeid, file_handle, ph, events, flags, reply)
+                            .await;
+                    }));
             }
             ll::Operation::NotifyReply(_) => {
                 // TODO: handle FUSE_NOTIFY_REPLY
                 return Err(Errno::ENOSYS);
             }
             ll::Operation::BatchForget(x) => {
-                filesystem
-                    .batch_forget(
-                        self.request_header(),
-                        ForgetOne::slice_from_inner(x.nodes()),
-                    )
-                    .await; // no reply
+                let nodes: Vec<ForgetOne> = ForgetOne::vec_from_inner(x.nodes());
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.batch_forget(&header, &nodes).await;
+                    }));
             }
             ll::Operation::FAllocate(x) => {
-                filesystem
-                    .fallocate(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.offset()?,
-                        x.len()?,
-                        x.mode(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let offset = x.offset()?;
+                let len = x.len()?;
+                let mode = x.mode();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .fallocate(&header, nodeid, file_handle, offset, len, mode, reply)
+                            .await;
+                    }));
             }
             ll::Operation::ReadDirPlus(x) => {
-                filesystem
-                    .readdirplus(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.offset(),
-                        ReplyDirectoryPlus::new(
-                            self.request.unique(),
-                            ReplySender::Channel(self.ch.clone()),
-                            x.size() as usize,
-                        ),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let offset = x.offset();
+                let size = x.size();
+                let reply = ReplyDirectoryPlus::new(
+                    self.request.unique(),
+                    ReplySender::Channel(self.ch.clone()),
+                    size as usize,
+                );
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .readdirplus(&header, nodeid, file_handle, offset, reply)
+                            .await;
+                    }));
             }
             ll::Operation::Rename2(x) => {
-                filesystem
-                    .rename(
-                        self.request_header(),
-                        x.from().dir,
-                        x.from().name.as_ref(),
-                        x.to().dir,
-                        x.to().name.as_ref(),
-                        x.flags(),
-                        self.reply(),
-                    )
-                    .await;
+                let from_dir = x.from().dir;
+                let from_name = x.from().name.as_os_str().to_os_string();
+                let to_dir = x.to().dir;
+                let to_name = x.to().name.as_os_str().to_os_string();
+                let flags = x.flags();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .rename(
+                                &header, from_dir, &from_name, to_dir, &to_name, flags, reply,
+                            )
+                            .await;
+                    }));
             }
             ll::Operation::Lseek(x) => {
-                filesystem
-                    .lseek(
-                        self.request_header(),
-                        self.request.nodeid(),
-                        x.file_handle(),
-                        x.offset(),
-                        x.whence(),
-                        self.reply(),
-                    )
-                    .await;
+                let file_handle = x.file_handle();
+                let offset = x.offset();
+                let whence = x.whence();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .lseek(&header, nodeid, file_handle, offset, whence, reply)
+                            .await;
+                    }));
             }
             ll::Operation::CopyFileRange(x) => {
                 let (i, o) = (x.src()?, x.dest()?);
-                filesystem
-                    .copy_file_range(
-                        self.request_header(),
-                        i.inode,
-                        i.file_handle,
-                        i.offset,
-                        o.inode,
-                        o.file_handle,
-                        o.offset,
-                        x.len(),
-                        x.flags(),
-                        self.reply(),
-                    )
-                    .await;
+                let len = x.len();
+                let flags = x.flags();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .copy_file_range(
+                                &header,
+                                i.inode,
+                                i.file_handle,
+                                i.offset,
+                                o.inode,
+                                o.file_handle,
+                                o.offset,
+                                len,
+                                flags,
+                                reply,
+                            )
+                            .await;
+                    }));
             }
             #[cfg(target_os = "macos")]
             ll::Operation::SetVolName(x) => {
-                filesystem
-                    .setvolname(self.request_header(), x.name(), self.reply())
-                    .await;
+                let name = x.name().as_os_str().to_os_string();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.setvolname(&header, &name, reply).await;
+                    }));
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes(x) => {
-                filesystem
-                    .getxtimes(self.request_header(), x.nodeid(), self.reply())
-                    .await;
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem.getxtimes(&header, nodeid, reply).await;
+                    }));
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange(x) => {
-                filesystem
-                    .exchange(
-                        self.request_header(),
-                        x.from().dir,
-                        x.from().name.as_ref(),
-                        x.to().dir,
-                        x.to().name.as_ref(),
-                        x.options(),
-                        self.reply(),
-                    )
-                    .await;
+                let from_dir = x.from().dir;
+                let from_name = x.from().name.as_os_str().to_os_string();
+                let to_dir = x.to().dir;
+                let to_name = x.to().name.as_os_str().to_os_string();
+                let options = x.options();
+                let reply = self.reply();
+                se.handler_runtime
+                    .spawn(se.task_tracker.track_future(async move {
+                        filesystem
+                            .exchange(
+                                &header, from_dir, &from_name, to_dir, &to_name, options, reply,
+                            )
+                            .await;
+                    }));
             }
-
             ll::Operation::CuseInit(_) => {
                 // TODO: handle CUSE_INIT
                 return Err(Errno::ENOSYS);

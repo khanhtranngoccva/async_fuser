@@ -305,10 +305,9 @@ impl<FS: Filesystem> Session<FS> {
 
         let n_event_loop_workers = config.n_event_loop_workers.unwrap_or(1);
         let n_handler_workers = config.n_handler_workers.unwrap_or(1);
-        let event_loop_runtime = DroppableRuntime::new("afuser-evt", n_event_loop_workers, true)?;
-        let handler_runtime = Arc::new(DroppableRuntime::new(
+        let runtime = Arc::new(DroppableRuntime::new(
             "afuser-hnd",
-            n_handler_workers,
+            n_event_loop_workers + n_handler_workers,
             true,
         )?);
         log::info!(
@@ -357,10 +356,10 @@ impl<FS: Filesystem> Session<FS> {
                 allowed: config.acl,
                 session_owner,
                 cancellation_token: cancellation_token.child_token(),
-                handler_runtime: handler_runtime.clone(),
+                handler_runtime: runtime.clone(),
                 task_tracker: task_tracker.clone(),
             };
-            tasks.push(event_loop_runtime.spawn(async move { event_loop.event_loop().await }));
+            tasks.push(runtime.spawn(async move { event_loop.event_loop().await }));
         }
 
         let mut reply: io::Result<()> = Ok(());
@@ -381,8 +380,7 @@ impl<FS: Filesystem> Session<FS> {
         // Wait until all tasks spawned by the event loop and handler runtime are completed.
         task_tracker.close();
         task_tracker.wait().await;
-        drop(handler_runtime);
-        drop(event_loop_runtime);
+        drop(runtime);
 
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
             return Err(io::Error::other(

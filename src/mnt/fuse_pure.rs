@@ -303,58 +303,73 @@ fn parse_fusermount_unmount_stderr(output: &OsStr) -> Option<OsString> {
     })
 }
 
-// FIXME: Integrate async if possible
-async fn receive_fusermount_message(socket: &UnixStream) -> Result<DevFuse, Error> {
-    let mut io_vec_buf = [0u8];
-    let mut iov = [IoSliceMut::new(&mut io_vec_buf)];
-    let mut cmsg_buffer = nix::cmsg_space!(RawFd);
+// Explicitly marked Send bound
+#[allow(clippy::manual_async_fn)]
+fn receive_fusermount_message<'a>(
+    socket: &'a UnixStream,
+) -> impl Future<Output = Result<DevFuse, Error>> + Send + 'a {
+    async move {
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(|s| {
+                s.spawn_blocking(move || {
+                    let mut io_vec_buf = [0u8];
+                    let mut iov = [IoSliceMut::new(&mut io_vec_buf)];
+                    let mut cmsg_buffer = nix::cmsg_space!(RawFd);
 
-    let msg = loop {
-        match recvmsg::<SockaddrStorage>(
-            socket.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg_buffer),
-            MsgFlags::empty(),
-        ) {
-            Ok(msg) => break msg,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => return Err(e.into()),
-        }
-    };
+                    let msg = loop {
+                        match recvmsg::<SockaddrStorage>(
+                            socket.as_raw_fd(),
+                            &mut iov,
+                            Some(&mut cmsg_buffer),
+                            MsgFlags::empty(),
+                        ) {
+                            Ok(msg) => break msg,
+                            Err(nix::errno::Errno::EINTR) => continue,
+                            Err(e) => return Err(e.into()),
+                        }
+                    };
 
-    if msg.bytes == 0 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "Unexpected EOF reading from fusermount",
-        ));
-    }
-
-    for cmsg in msg
-        .cmsgs()
-        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?
-    {
-        match cmsg {
-            ControlMessageOwned::ScmRights(fds) => {
-                if let Some(&fd) = fds.first() {
-                    if fd < 0 {
-                        return Err(ErrorKind::InvalidData.into());
+                    if msg.bytes == 0 {
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Unexpected EOF reading from fusermount",
+                        ));
                     }
-                    return Ok(DevFuse::try_from_fd(unsafe { OwnedFd::from_raw_fd(fd) }).await?);
-                }
-            }
-            other => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Unknown control message from fusermount: {:?}", other),
-                ));
-            }
-        }
-    }
 
-    Err(Error::new(
-        ErrorKind::InvalidData,
-        "No SCM_RIGHTS message received from fusermount",
-    ))
+                    for cmsg in msg
+                        .cmsgs()
+                        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?
+                    {
+                        match cmsg {
+                            ControlMessageOwned::ScmRights(fds) => {
+                                if let Some(&fd) = fds.first() {
+                                    if fd < 0 {
+                                        return Err(ErrorKind::InvalidData.into());
+                                    }
+                                    return Ok(OwnedFd::from_raw_fd(fd));
+                                }
+                            }
+                            other => {
+                                return Err(Error::new(
+                                    ErrorKind::InvalidData,
+                                    format!("Unknown control message from fusermount: {:?}", other),
+                                ));
+                            }
+                        }
+                    }
+
+                    Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "No SCM_RIGHTS message received from fusermount",
+                    ))
+                });
+            })
+        }
+        .await;
+        let future = futures.pop().expect("no future returned");
+        let fd = future.expect("failed to join future")?;
+        DevFuse::try_from_fd(fd).await
+    }
 }
 
 /// Clear `FD_CLOEXEC` after fork before exec.

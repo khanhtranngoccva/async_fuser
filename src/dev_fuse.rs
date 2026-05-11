@@ -74,10 +74,7 @@ impl DevFuse {
     #[allow(dead_code)]
     pub(crate) async fn open() -> io::Result<Self> {
         // TODO: make this configurable
-        let client = Arc::new(
-            Client::build(UringCfg::default())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
-        );
+        let client = Arc::new(Client::build(UringCfg::default()).map_err(io::Error::other)?);
         let fuse = client
             .open_path(Self::PATH, OFlag::O_RDWR, Permissions::from_mode(0))
             .completion()
@@ -94,10 +91,7 @@ impl DevFuse {
 
     #[allow(dead_code)]
     pub(crate) async fn try_from_fd(fd: OwnedFd) -> io::Result<Self> {
-        let client = Arc::new(
-            Client::build(UringCfg::default())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
-        );
+        let client = Arc::new(Client::build(UringCfg::default()).map_err(io::Error::other)?);
         let mut file = client
             .register_owned(fd)
             .map::<Box<dyn UringTarget + Send + Sync>, _>(|f| Box::new(f))

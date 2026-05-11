@@ -154,7 +154,7 @@ impl ReplyRaw {
 impl Drop for ReplyRaw {
     fn drop(&mut self) {
         let _ = self.sender.take().map(|sender| {
-            let request_id = self.unique.clone();
+            let request_id = self.unique;
             warn!(
                 "Reply not sent for operation {}, replying with I/O error",
                 request_id.0

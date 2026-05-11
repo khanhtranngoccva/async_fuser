@@ -158,7 +158,7 @@ impl Drop for MountImpl {
         // async umount_impl method to unmount the filesystem. In the future, the AsyncDrop trait should be used
         runtime::execute_future_from_sync(async move {
             while owned_state.is_some() {
-                match unmount_state_obj(&mut owned_state, &flags).await {
+                match unmount_state_obj(&mut owned_state, flags).await {
                     Ok(()) => return,
                     Err(err) => {
                         let err_kind = err.kind();
@@ -232,13 +232,10 @@ async fn fuse_unmount_pure(mountpoint: &Path, flags: &[UnmountOption]) -> io::Re
     }
     let fusermount_error = parse_fusermount_unmount_stderr(OsStr::from_bytes(&output.stderr))
         .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::Other,
-                format!(
-                    "Failed to parse fusermount umount error message: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            )
+            io::Error::other(format!(
+                "Failed to parse fusermount umount error message: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
         })?;
     // Since `fusermount` does not invoke any locale functions,
     // the locale used for `strerror` in the program is guaranteed to be `C`.
@@ -248,20 +245,14 @@ async fn fuse_unmount_pure(mountpoint: &Path, flags: &[UnmountOption]) -> io::Re
     )
     .map_err(|e| {
         error!("failed to get errno by fusermount umount message: {}", e);
-        io::Error::new(
-            ErrorKind::Other,
-            "failed to get errno by fusermount umount message",
-        )
+        io::Error::other("failed to get errno by fusermount umount message")
     })?
     .ok_or_else(|| {
         error!(
             "errno not found for fusermount umount message: {:?}",
             fusermount_error
         );
-        io::Error::new(
-            ErrorKind::Other,
-            "errno not found for fusermount umount message",
-        )
+        io::Error::other("errno not found for fusermount umount message")
     })?;
     Err(Error::from_raw_os_error(errno.code()))
 }
@@ -435,7 +426,7 @@ async fn fuse_mount_fusermount(
             return if stderr_string.contains("only allowed if 'user_allow_other' is set") {
                 Err(io::Error::new(ErrorKind::PermissionDenied, stderr_string))
             } else {
-                Err(io::Error::new(ErrorKind::Other, stderr_string))
+                Err(io::Error::other(stderr_string))
             };
         }
     };
@@ -496,8 +487,7 @@ async fn fuse_mount_mount_fusefs(
 
     let output = builder.output().await?;
     if !output.status.success() {
-        return Err(io::Error::new(
-            ErrorKind::Other,
+        return Err(io::Error::other(
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
@@ -623,12 +613,9 @@ async fn fuse_mount_sys(
     match result {
         Ok(()) => Ok(Some(file)),
         Err(nix::errno::Errno::EPERM) => Ok(None), // Retry with fusermount
-        Err(e) => Err(Error::new(
-            ErrorKind::Other,
-            format!(
-                "Error calling mount() at {mountpoint:?} with {mount_options:?} and flags={flags:?}: {e}"
-            ),
-        )),
+        Err(e) => Err(io::Error::other(format!(
+            "Error calling mount() at {mountpoint:?} with {mount_options:?} and flags={flags:?}: {e}"
+        ))),
     }
 }
 

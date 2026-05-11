@@ -71,7 +71,7 @@ impl Channel {
                 result
             }
         }?;
-        return Ok(result);
+        Ok(result)
     }
 
     /// Returns a sender object for this channel. The sender object can be

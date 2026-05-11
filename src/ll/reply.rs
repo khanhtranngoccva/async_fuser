@@ -398,7 +398,7 @@ impl EntListBuf {
     /// value to request the next entries in further readdir calls
     #[must_use]
     pub(crate) fn push(&mut self, ent: [&[u8]; 2]) -> bool {
-        debug_assert!(self.buf.len() % size_of::<u64>() == 0);
+        debug_assert!(self.buf.len().is_multiple_of(size_of::<u64>()));
 
         let entlen = ent[0].len() + ent[1].len();
         let entsize = entlen.next_multiple_of(size_of::<u64>()); // 64 bit align

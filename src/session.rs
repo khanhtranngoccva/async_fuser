@@ -187,21 +187,21 @@ impl<FS: Filesystem> Session<FS> {
         options: &Config,
     ) -> io::Result<Session<FS>> {
         check_option_conflicts(options)?;
-        if let Some(n_handler_workers) = options.n_handler_workers {
-            if n_handler_workers == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "n_handler_workers must be greater than 0",
-                ));
-            }
+        if let Some(n_handler_workers) = options.n_handler_workers
+            && n_handler_workers == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "n_handler_workers must be greater than 0",
+            ));
         }
-        if let Some(n_event_loop_workers) = options.n_event_loop_workers {
-            if n_event_loop_workers == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "n_event_loop_workers must be greater than 0",
-                ));
-            }
+        if let Some(n_event_loop_workers) = options.n_event_loop_workers
+            && n_event_loop_workers == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "n_event_loop_workers must be greater than 0",
+            ));
         }
         let mountpoint = mountpoint.as_ref();
         info!("Mounting {}", mountpoint.display());
@@ -240,21 +240,21 @@ impl<FS: Filesystem> Session<FS> {
     /// Wrap an existing /dev/fuse file descriptor. This doesn't mount the
     /// filesystem anywhere; that must be done separately.
     pub async fn from_fd(filesystem: FS, fd: OwnedFd, config: Config) -> io::Result<Self> {
-        if let Some(n_handler_workers) = config.n_handler_workers {
-            if n_handler_workers == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "n_handler_workers must be greater than 0",
-                ));
-            }
+        if let Some(n_handler_workers) = config.n_handler_workers
+            && n_handler_workers == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "n_handler_workers must be greater than 0",
+            ));
         }
-        if let Some(n_event_loop_workers) = config.n_event_loop_workers {
-            if n_event_loop_workers == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "n_event_loop_workers must be greater than 0",
-                ));
-            }
+        if let Some(n_event_loop_workers) = config.n_event_loop_workers
+            && n_event_loop_workers == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "n_event_loop_workers must be greater than 0",
+            ));
         }
         let ch = Channel::new(Arc::new(DevFuse::try_from_fd(fd).await?));
         let mut session = Session {
@@ -370,10 +370,10 @@ impl<FS: Filesystem> Session<FS> {
                     return Err(io::Error::other("event loop thread panicked"));
                 }
             };
-            if let Err(e) = res {
-                if reply.is_ok() {
-                    reply = Err(e);
-                }
+            if let Err(e) = res
+                && reply.is_ok()
+            {
+                reply = Err(e);
             }
         }
 
@@ -423,7 +423,7 @@ impl<FS: Filesystem> Session<FS> {
                         "FUSE device disconnected during handshake",
                     ));
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(err),
             };
             // Parse the request
             let request = match ll::AnyRequest::try_from(&buf[..size]) {
@@ -632,7 +632,7 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                 Err(err) if err.raw_os_error() == Some(Errno::ECANCELED.into()) => {
                     return Ok(());
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(err),
             };
             loop {
                 let size = match self
@@ -650,7 +650,7 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                         continue 'outer_loop;
                     }
                     Err(err) if err.raw_os_error() == Some(ENODEV) => return Ok(()),
-                    Err(err) => return Err(err.into()),
+                    Err(err) => return Err(err),
                 };
                 match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
@@ -710,7 +710,7 @@ impl BackgroundSession {
         }
         self.guard
             .await
-            .map_err(|e| (None, io::Error::new(io::ErrorKind::Other, e)))?
+            .map_err(|e| (None, io::Error::other(e)))?
             .map_err(|e| (None, e))
     }
 
@@ -721,9 +721,7 @@ impl BackgroundSession {
 
     /// Join the filesystem thread.
     pub async fn join(self) -> io::Result<()> {
-        self.guard
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        self.guard.await.map_err(io::Error::other)?
     }
 }
 

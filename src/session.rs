@@ -43,6 +43,7 @@ use crate::ll::Version;
 use crate::ll::flags::init_flags::InitFlags;
 use crate::ll::fuse_abi as abi;
 use crate::mnt::Mount;
+use crate::mnt::drop_umount_flags;
 use crate::mnt::mount_options::Config;
 use crate::mnt::mount_options::check_option_conflicts;
 use crate::notify::Notifier;
@@ -283,7 +284,7 @@ impl<FS: Filesystem> Session<FS> {
         let host_runtime = DroppableRuntime::new("afuser-tmp", 1, false)?;
         let guard = host_runtime.spawn(self.run_internal());
         Ok(BackgroundSession {
-            guard,
+            guard: Some(guard),
             sender,
             mount,
             _runtime: host_runtime,
@@ -679,7 +680,7 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
 #[derive(Debug)]
 pub struct BackgroundSession {
     /// Thread guard of the background session
-    pub guard: JoinHandle<io::Result<()>>,
+    pub guard: Option<JoinHandle<io::Result<()>>>,
     /// Runtime for the background session, which hosts a single task that runs the session loop.
     _runtime: DroppableRuntime,
     /// Object for creating Notifiers for client use
@@ -691,27 +692,37 @@ pub struct BackgroundSession {
 }
 
 impl BackgroundSession {
+    async fn _umount_and_join(&mut self, flags: &[UnmountOption]) -> Result<(), io::Error> {
+        if let Some(mount) = self.mount.take() {
+            match mount.umount(flags).await {
+                Ok(()) => {}
+                Err((mount, error)) => {
+                    self.mount = mount;
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(guard) = self.guard.take() {
+            guard.await.map_err(io::Error::other)??
+        }
+        Ok(())
+    }
+
     /// Unmount the filesystem and join the background thread.
     pub async fn umount_and_join(
         mut self,
         flags: &[UnmountOption],
     ) -> Result<(), (Option<Self>, io::Error)> {
-        if let Some(mount) = self.mount.take() {
-            match mount.umount(flags).await {
-                Ok(()) => {}
-                Err((Some(mount), error)) => {
-                    self.mount = Some(mount);
-                    return Err((Some(self), error));
-                }
-                Err((None, error)) => {
-                    return Err((None, error));
-                }
-            }
-        }
-        self.guard
-            .await
-            .map_err(|e| (None, io::Error::other(e)))?
-            .map_err(|e| (None, e))
+        self._umount_and_join(flags).await.map_err(|e| {
+            (
+                if self.mount.is_some() {
+                    Some(self)
+                } else {
+                    None
+                },
+                e,
+            )
+        })
     }
 
     /// Returns an object that can be used to send notifications to the kernel
@@ -719,15 +730,27 @@ impl BackgroundSession {
         Notifier::new(self.sender.clone())
     }
 
-    /// Join the filesystem thread.
-    pub async fn join(self) -> io::Result<()> {
-        self.guard.await.map_err(io::Error::other)?
+    /// Join the filesystem thread without unmounting.
+    pub async fn join(mut self) -> io::Result<()> {
+        if let Some(guard) = self.guard.take() {
+            guard.await.map_err(io::Error::other)?
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for BackgroundSession {
+    fn drop(&mut self) {
+        runtime::execute_future_from_sync(async move {
+            self._umount_and_join(drop_umount_flags()).await.unwrap()
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, Filesystem, Session, runtime};
+    use crate::{Config, Filesystem, Session};
 
     struct DummyFS {}
 
@@ -768,6 +791,6 @@ mod tests {
         let bg_session = session.spawn().unwrap();
 
         // Unmount the session using sync mode in a current thread runtime to simulate the function being called from a Drop impl, should not deadlock with internal tasks
-        runtime::execute_future_from_sync(bg_session.umount_and_join(&[])).unwrap();
+        drop(bg_session);
     }
 }

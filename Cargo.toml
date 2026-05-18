@@ -20,7 +20,7 @@ async-trait = "0.1.89"
 page_size = "0.6.0"
 regex = "1.12.3"
 xutex = { version = "0.2.1", features = ["std"] }
-bimap = "0.6.3"
+bimap = "0.6.3"         
 dashmap = "6.1.0"
 lazy_static = "1.5.0"
 async_hybrid_fs = { git = "https://github.com/khanhtranngoccva/async_hybrid_fs", rev = "c8ae205221aef4dfdd2ebc9522545aee38ab2797", version = "0.1.0" }

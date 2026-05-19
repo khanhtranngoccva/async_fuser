@@ -5,6 +5,7 @@
 //! filesystem is mounted, the session loop receives, dispatches and replies to kernel requests
 //! for filesystem operations under its mount point.
 
+use futures::future;
 use libc::ENODEV;
 use std::borrow::Cow;
 use std::fmt::Debug;
@@ -364,17 +365,26 @@ impl<FS: Filesystem> Session<FS> {
         }
 
         let mut reply: io::Result<()> = Ok(());
-        for thread in tasks {
-            let res = match thread.await {
-                Ok(res) => res,
-                Err(_) => {
-                    return Err(io::Error::other("event loop thread panicked"));
+        let mut remaining = tasks;
+        while !remaining.is_empty() {
+            let result;
+            let _index;
+            (result, _index, remaining) = future::select_all(remaining).await;
+            match result {
+                // Wait for the next event loop to complete.
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    reply = Err(e);
                 }
-            };
-            if let Err(e) = res
-                && reply.is_ok()
-            {
-                reply = Err(e);
+                Err(_join_error) => {
+                    // Must abort the remaining event loop tasks.
+                    for remaining_task in remaining {
+                        remaining_task.abort();
+                        let _ = remaining_task.await;
+                    }
+                    reply = Err(io::Error::other("event loop thread panicked"));
+                    break;
+                }
             }
         }
 
@@ -383,6 +393,7 @@ impl<FS: Filesystem> Session<FS> {
         task_tracker.wait().await;
         drop(runtime);
 
+        // Destroy the filesystem.
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
             return Err(io::Error::other(
                 "BUG: must have one refcount for filesystem",
@@ -401,8 +412,7 @@ impl<FS: Filesystem> Session<FS> {
     /// # Errors
     /// Returns any final error when the session comes to an end.
     pub async fn run(self) -> io::Result<()> {
-        let host_runtime = DroppableRuntime::new("afuser-tmp", 1, false)?;
-        host_runtime.spawn(self.run_internal()).await?
+        self.spawn()?.join().await
     }
 
     async fn handshake(&mut self) -> io::Result<()> {

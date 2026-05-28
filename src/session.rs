@@ -420,13 +420,7 @@ impl<FS: Filesystem> Session<FS> {
         let buf = buf.as_mut();
 
         loop {
-            let _ready_guard = self.ch.read_ready(&self.cancellation_token).await?;
-            // Read the init request from the kernel
-            let size = match self
-                .ch
-                .receive_nonblocking(buf, &self.cancellation_token)
-                .await
-            {
+            let size = match self.ch.receive(buf, &self.cancellation_token).await {
                 Ok(size) => size,
                 Err(err) if err.raw_os_error() == Some(ENODEV) => {
                     return Err(io::Error::new(
@@ -635,51 +629,32 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buf = FuseReadBuf::new();
         let buf = buf.as_mut();
-        'outer_loop: loop {
-            // Read the next request from the given channel to kernel driver
-            // The kernel driver makes sure that we get exactly one request per read
-            let _ready_guard = match self.ch.read_ready(&self.cancellation_token).await {
-                Ok(guard) => guard,
+        loop {
+            let size = match self.ch.receive(buf, &self.cancellation_token).await {
+                Ok(size) => size,
+                // If the cancellation token is triggered, return Ok(()) immediately. FS destruction occurs later
                 Err(err) if err.raw_os_error() == Some(Errno::ECANCELED.into()) => {
                     return Ok(());
                 }
+                Err(err) if err.raw_os_error() == Some(ENODEV) => return Ok(()),
                 Err(err) => return Err(err),
             };
-            loop {
-                let size = match self
-                    .ch
-                    .receive_nonblocking(buf, &self.cancellation_token)
-                    .await
-                {
-                    Ok(size) => size,
-                    // If the cancellation token is triggered, return Ok(()) immediately. FS destruction occurs later
-                    Err(err) if err.raw_os_error() == Some(Errno::ECANCELED.into()) => {
+            match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
+                // Dispatch request
+                Some(req) => {
+                    if let Ok(Operation::Destroy(_)) = req.request.operation() {
+                        req.reply::<ReplyEmpty>().ok().await;
                         return Ok(());
+                    } else {
+                        req.dispatch(self).await;
                     }
-                    Err(err) if err.raw_os_error() == Some(Errno::EAGAIN.into()) => {
-                        // Need to go to outer loop to poll.
-                        continue 'outer_loop;
-                    }
-                    Err(err) if err.raw_os_error() == Some(ENODEV) => return Ok(()),
-                    Err(err) => return Err(err),
-                };
-                match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
-                    // Dispatch request
-                    Some(req) => {
-                        if let Ok(Operation::Destroy(_)) = req.request.operation() {
-                            req.reply::<ReplyEmpty>().ok().await;
-                            return Ok(());
-                        } else {
-                            req.dispatch(self).await;
-                        }
-                    }
-                    // Quit loop on illegal request
-                    None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Invalid request",
-                        ));
-                    }
+                }
+                // Quit loop on illegal request
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid request",
+                    ));
                 }
             }
         }

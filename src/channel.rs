@@ -50,28 +50,38 @@ impl Channel {
     }
 
     /// Receives data up to the capacity of the buffer, and cancels upon triggering of the CancellationToken.
-    pub(crate) async fn receive_nonblocking(
+    pub(crate) async fn receive(
         &self,
         buffer: &mut [u8],
         cancellation: &CancellationToken,
     ) -> io::Result<usize> {
-        let mut upgraded_target = unsafe { self.0.client.to_target(self.0.as_ref()) };
-        let mut read_attempt = self.0.client.read(&mut upgraded_target, buffer);
-        let completion = read_attempt
-            .completion()
-            .expect("newly initialized pending IO operation must have a completion");
-        let result = tokio::select! {
-            _ = cancellation.cancelled() => {
-                match read_attempt.cancel().await {
-                    Some(result) => result,
-                    None => Err(io::Error::from_raw_os_error(Errno::ECANCELED.into())),
+        loop {
+            let mut upgraded_target = unsafe { self.0.client.to_target(self.0.as_ref()) };
+            let mut read_attempt = self.0.client.read(&mut upgraded_target, buffer);
+            let completion = read_attempt
+                .completion()
+                .expect("newly initialized pending IO operation must have a completion");
+            let result = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    match read_attempt.cancel().await {
+                        Some(result) => result,
+                        None => Err(io::Error::from_raw_os_error(Errno::ECANCELED.into())),
+                    }
                 }
+                result = completion => {
+                    result
+                }
+            };
+            match result {
+                Ok(result) => return Ok(result),
+                // Perform the epoll to wait for commands. This is only triggered if the client is in fallback mode.
+                Err(err) if err.raw_os_error() == Some(Errno::EAGAIN.into()) => {
+                    let _ = self.read_ready(cancellation).await?;
+                    continue;
+                }
+                Err(err) => return Err(err),
             }
-            result = completion => {
-                result
-            }
-        }?;
-        Ok(result)
+        }
     }
 
     /// Returns a sender object for this channel. The sender object can be

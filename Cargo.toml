@@ -13,7 +13,7 @@ nix = { version = "0.31.2", features = ["fs", "user", "poll", "socket", "uio", "
 num_enum = "0.7.5"
 ref-cast = "1.0.25"
 smallvec = "1.15.1"
-tokio = { version = "1.50.0", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.50.0", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "tracing"] }
 zerocopy = { version = "0.8.42", features = ["derive"] }
 serde = { version = "1.0.102", features = ["std", "derive"], optional = true }
 async-trait = "0.1.89"

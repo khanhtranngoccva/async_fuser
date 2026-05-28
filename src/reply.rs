@@ -33,6 +33,7 @@ use crate::ll::reply::DirEntryPlus;
 use crate::ll::reply::Response;
 use crate::ll::{self};
 use crate::passthrough::BackingId;
+use crate::request::CancelCookie;
 use crate::runtime;
 
 /// Generic reply callback to send data
@@ -104,7 +105,14 @@ impl AssertSender {
 /// Generic reply trait
 pub(crate) trait Reply: Send + 'static {
     /// Create a new reply for the given request
-    fn new(unique: ll::RequestId, sender: ReplySender) -> Self;
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> Self;
+}
+
+/// Generic interruptible trait for replies, used to check when the corresponding I/O request was interrupted.
+pub trait InterruptibleReply: Send + 'static {
+    /// Resolves when the corresponding I/O request gets interrupted by the operating system. When that happens, requests should stop their underlying work and return an [`crate::ll::Errno::EINTR`] error if they can.
+    /// This should be used in a similar manner to the [`CancellationToken::cancelled`](tokio_util::sync::CancellationToken::cancelled) method.
+    fn interrupted(&self) -> impl Future<Output = ()> + Send;
 }
 
 ///
@@ -116,22 +124,34 @@ pub(crate) struct ReplyRaw {
     unique: ll::RequestId,
     /// Closure to call for sending the reply
     sender: Option<ReplySender>,
+    /// Cancel cookie for the request
+    cancel_cookie: Option<CancelCookie>,
 }
 
 impl Reply for ReplyRaw {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyRaw {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyRaw {
         ReplyRaw {
             unique,
             sender: Some(sender),
+            cancel_cookie: Some(cancel_cookie),
+        }
+    }
+}
+
+impl InterruptibleReply for ReplyRaw {
+    async fn interrupted(&self) -> () {
+        if let Some(cancel_cookie) = self.cancel_cookie.as_ref() {
+            cancel_cookie.cancelled().await;
         }
     }
 }
 
 impl ReplyRaw {
-    /// Reply to a request with the given error code and data. Must be called
-    /// only once (the `ok` and `error` methods ensure this by consuming `self`)
+    /// Reply to a request with the given error code and data. Must be called only once (the `ok` and `error` methods ensure this by consuming `self`)
     pub(crate) async fn send_ll_mut(&mut self, response: &impl Response) {
         assert!(self.sender.is_some());
+        // Before the request completes, the cancellation cookie has to be dropped. The next request can then have a new cookie with the reused request ID.
+        drop(self.cancel_cookie.take());
         let sender = self.sender.take().unwrap();
         let res = response
             .with_iovec(self.unique, async |iov| sender.send(iov).await)
@@ -155,6 +175,7 @@ impl Drop for ReplyRaw {
     fn drop(&mut self) {
         let _ = self.sender.take().map(|sender| {
             let request_id = self.unique;
+            drop(self.cancel_cookie.take());
             warn!(
                 "Reply not sent for operation {}, replying with I/O error",
                 request_id.0
@@ -181,10 +202,16 @@ pub struct ReplyEmpty {
 }
 
 impl Reply for ReplyEmpty {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyEmpty {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyEmpty {
         ReplyEmpty {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyEmpty {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -209,10 +236,16 @@ pub struct ReplyData {
 }
 
 impl Reply for ReplyData {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyData {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyData {
         ReplyData {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyData {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -237,10 +270,16 @@ pub struct ReplyEntry {
 }
 
 impl Reply for ReplyEntry {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyEntry {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyEntry {
         ReplyEntry {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyEntry {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -284,10 +323,16 @@ pub struct ReplyAttr {
 }
 
 impl Reply for ReplyAttr {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyAttr {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyAttr {
         ReplyAttr {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyAttr {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -316,10 +361,17 @@ pub struct ReplyXTimes {
 
 #[cfg(target_os = "macos")]
 impl Reply for ReplyXTimes {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyXTimes {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyXTimes {
         ReplyXTimes {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl InterruptibleReply for ReplyXTimes {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -347,10 +399,17 @@ pub struct ReplyOpen {
 }
 
 impl Reply for ReplyOpen {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyOpen {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyOpen {
         ReplyOpen {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl InterruptibleReply for ReplyOpen {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -433,10 +492,16 @@ pub struct ReplyWrite {
 }
 
 impl Reply for ReplyWrite {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyWrite {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyWrite {
         ReplyWrite {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyWrite {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -463,10 +528,16 @@ pub struct ReplyStatfs {
 }
 
 impl Reply for ReplyStatfs {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyStatfs {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyStatfs {
         ReplyStatfs {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyStatfs {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -506,10 +577,16 @@ pub struct ReplyCreate {
 }
 
 impl Reply for ReplyCreate {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyCreate {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyCreate {
         ReplyCreate {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyCreate {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -608,10 +685,16 @@ pub struct ReplyLock {
 }
 
 impl Reply for ReplyLock {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyLock {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyLock {
         ReplyLock {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyLock {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -642,10 +725,16 @@ pub struct ReplyBmap {
 }
 
 impl Reply for ReplyBmap {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyBmap {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyBmap {
         ReplyBmap {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyBmap {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -672,10 +761,16 @@ pub struct ReplyIoctl {
 }
 
 impl Reply for ReplyIoctl {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyIoctl {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyIoctl {
         ReplyIoctl {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyIoctl {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -702,10 +797,16 @@ pub struct ReplyPoll {
 }
 
 impl Reply for ReplyPoll {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyPoll {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyPoll {
         ReplyPoll {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyPoll {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -734,9 +835,14 @@ pub struct ReplyDirectory {
 
 impl ReplyDirectory {
     /// Creates a new `ReplyDirectory` with a specified buffer size.
-    pub(crate) fn new(unique: ll::RequestId, sender: ReplySender, size: usize) -> ReplyDirectory {
+    pub(crate) fn new(
+        unique: ll::RequestId,
+        sender: ReplySender,
+        size: usize,
+        cancel_cookie: CancelCookie,
+    ) -> ReplyDirectory {
         ReplyDirectory {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
             data: DirEntList::new(size),
         }
     }
@@ -778,15 +884,22 @@ pub struct ReplyDirectoryPlus {
     buf: DirEntPlusList,
 }
 
+impl InterruptibleReply for ReplyDirectoryPlus {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
+    }
+}
+
 impl ReplyDirectoryPlus {
     /// Creates a new `ReplyDirectory` with a specified buffer size.
     pub(crate) fn new(
         unique: ll::RequestId,
         sender: ReplySender,
         size: usize,
+        cancel_cookie: CancelCookie,
     ) -> ReplyDirectoryPlus {
         ReplyDirectoryPlus {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
             buf: DirEntPlusList::new(size),
         }
     }
@@ -836,10 +949,16 @@ pub struct ReplyXattr {
 }
 
 impl Reply for ReplyXattr {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyXattr {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyXattr {
         ReplyXattr {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyXattr {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -871,10 +990,16 @@ pub struct ReplyLseek {
 }
 
 impl Reply for ReplyLseek {
-    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyLseek {
+    fn new(unique: ll::RequestId, sender: ReplySender, cancel_cookie: CancelCookie) -> ReplyLseek {
         ReplyLseek {
-            reply: Reply::new(unique, sender),
+            reply: Reply::new(unique, sender, cancel_cookie),
         }
+    }
+}
+
+impl InterruptibleReply for ReplyLseek {
+    async fn interrupted(&self) -> () {
+        self.reply.interrupted().await;
     }
 }
 
@@ -946,7 +1071,8 @@ mod test {
                 0x00, 0x00, 0x12, 0x34, 0x78, 0x56,
             ],
         });
-        let reply: ReplyRaw = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyRaw = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply
             .send_ll(&ll::ResponseData::new_data(data.as_bytes()))
             .await;
@@ -960,7 +1086,8 @@ mod test {
                 0x00, 0x00,
             ],
         });
-        let reply: ReplyRaw = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyRaw = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply.error(Errno::from_i32(66)).await;
     }
 
@@ -972,7 +1099,8 @@ mod test {
                 0x00, 0x00,
             ],
         });
-        let reply: ReplyEmpty = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyEmpty = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply.ok().await;
     }
 
@@ -984,7 +1112,8 @@ mod test {
                 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef,
             ],
         });
-        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyData = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply.data(&[0xde, 0xad, 0xbe, 0xef]).await;
     }
 
@@ -1023,7 +1152,8 @@ mod test {
         expected[0] = (expected.len()) as u8;
 
         let sender = ReplySender::Assert(AssertSender { expected });
-        let reply: ReplyEntry = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyEntry = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         let time = UNIX_EPOCH + Duration::new(0x1234, 0x5678);
         let ttl = Duration::new(0x8765, 0x4321);
         let attr = FileAttr {
@@ -1078,7 +1208,8 @@ mod test {
         expected[0] = expected.len() as u8;
 
         let sender = ReplySender::Assert(AssertSender { expected });
-        let reply: ReplyAttr = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyAttr = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         let time = UNIX_EPOCH + Duration::new(0x1234, 0x5678);
         let ttl = Duration::new(0x8765, 0x4321);
         let attr = FileAttr {
@@ -1111,7 +1242,8 @@ mod test {
                 0x00, 0x00, 0x00, 0x00, 0x78, 0x56, 0x00, 0x00, 0x78, 0x56, 0x00, 0x00,
             ],
         });
-        let reply: ReplyXTimes = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyXTimes = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         let time = UNIX_EPOCH + Duration::new(0x1234, 0x5678);
         reply.xtimes(time, time).await;
     }
@@ -1125,7 +1257,8 @@ mod test {
                 0x00, 0x00, 0x00, 0x00,
             ],
         });
-        let reply: ReplyOpen = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyOpen = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply
             .opened(ll::FileHandle(0x1122), FopenFlags::from_bits_retain(0x33))
             .await;
@@ -1139,7 +1272,8 @@ mod test {
                 0x00, 0x00, 0x22, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ],
         });
-        let reply: ReplyWrite = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyWrite = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply.written(0x1122).await;
     }
 
@@ -1156,7 +1290,8 @@ mod test {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ],
         });
-        let reply: ReplyStatfs = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyStatfs = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply
             .statfs(0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88)
             .await;
@@ -1203,7 +1338,8 @@ mod test {
         expected[0] = (expected.len()) as u8;
 
         let sender = ReplySender::Assert(AssertSender { expected });
-        let reply: ReplyCreate = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyCreate = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         let time = UNIX_EPOCH + Duration::new(0x1234, 0x5678);
         let ttl = Duration::new(0x8765, 0x4321);
         let attr = FileAttr {
@@ -1243,7 +1379,8 @@ mod test {
                 0x00, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00,
             ],
         });
-        let reply: ReplyLock = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyLock = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply.locked(0x11, 0x22, 0x33, 0x44).await;
     }
 
@@ -1255,7 +1392,8 @@ mod test {
                 0x00, 0x00, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ],
         });
-        let reply: ReplyBmap = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyBmap = Reply::new(request_id, sender, CancelCookie::dummy(request_id));
         reply.bmap(0x1234).await;
     }
 
@@ -1271,7 +1409,9 @@ mod test {
                 0x00, 0x00, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0x2e, 0x72, 0x73,
             ],
         });
-        let mut reply = ReplyDirectory::new(ll::RequestId(0xdeadbeef), sender, 4096);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let mut reply =
+            ReplyDirectory::new(request_id, sender, 4096, CancelCookie::dummy(request_id));
         assert!(!reply.add(INodeNo(0xaabb), 1, FileType::Directory, "hello"));
         assert!(!reply.add(INodeNo(0xccdd), 2, FileType::RegularFile, "world.rs"));
         reply.ok().await;
@@ -1285,7 +1425,8 @@ mod test {
                 0x00, 0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
             ],
         });
-        let reply = ReplyXattr::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply = ReplyXattr::new(request_id, sender, CancelCookie::dummy(request_id));
         reply.size(0x12345678).await;
     }
 
@@ -1297,14 +1438,20 @@ mod test {
                 0x00, 0x00, 0x11, 0x22, 0x33, 0x44,
             ],
         });
-        let reply = ReplyXattr::new(ll::RequestId(0xdeadbeef), sender);
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply = ReplyXattr::new(request_id, sender, CancelCookie::dummy(request_id));
         reply.data(&[0x11, 0x22, 0x33, 0x44]).await;
     }
 
     #[tokio::test]
     async fn async_reply() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-        let reply: ReplyEmpty = Reply::new(ll::RequestId(0xdeadbeef), ReplySender::Sync(tx));
+        let request_id = ll::RequestId(0xdeadbeef);
+        let reply: ReplyEmpty = Reply::new(
+            request_id,
+            ReplySender::Sync(tx),
+            CancelCookie::dummy(request_id),
+        );
         tokio::spawn(async move {
             reply.ok().await;
         });

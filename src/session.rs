@@ -5,7 +5,6 @@
 //! filesystem is mounted, the session loop receives, dispatches and replies to kernel requests
 //! for filesystem operations under its mount point.
 
-use futures::future;
 use libc::ENODEV;
 use std::borrow::Cow;
 use std::fmt::Debug;
@@ -17,6 +16,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -52,6 +52,8 @@ use crate::read_buf::FuseReadBuf;
 use crate::reply::Reply;
 use crate::reply::ReplyRaw;
 use crate::reply::ReplySender;
+use crate::request::CancelCookie;
+use crate::request::CancelManager;
 use crate::request::RequestWithSender;
 use crate::runtime;
 use crate::runtime::DroppableRuntime;
@@ -347,7 +349,8 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
         channels.push(primary_channel);
-        let mut tasks = Vec::with_capacity(n_event_loop_workers);
+        let mut tasks = JoinSet::new();
+        let cancel_manager = Arc::new(CancelManager::new());
 
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = format!("fuser-{i}");
@@ -360,28 +363,25 @@ impl<FS: Filesystem> Session<FS> {
                 cancellation_token: cancellation_token.child_token(),
                 handler_runtime: runtime.clone(),
                 task_tracker: task_tracker.clone(),
+                cancel_manager: cancel_manager.clone(),
             };
-            tasks.push(runtime.spawn(async move { event_loop.event_loop().await }));
+            tasks
+                .build_task()
+                .name("async_fuser::event_loop")
+                .spawn_on(
+                    async move { event_loop.event_loop().await },
+                    runtime.handle(),
+                )?;
         }
 
         let mut reply: io::Result<()> = Ok(());
-        let mut remaining = tasks;
-        while !remaining.is_empty() {
-            let result;
-            let _index;
-            (result, _index, remaining) = future::select_all(remaining).await;
+        while let Some(result) = tasks.join_next().await {
             match result {
-                // Wait for the next event loop to complete.
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     reply = Err(e);
                 }
                 Err(_join_error) => {
-                    // Must abort the remaining event loop tasks.
-                    for remaining_task in remaining {
-                        remaining_task.abort();
-                        let _ = remaining_task.await;
-                    }
                     reply = Err(io::Error::other("event loop thread panicked"));
                     break;
                 }
@@ -454,9 +454,11 @@ impl<FS: Filesystem> Session<FS> {
                 _ => {
                     error!("Received non-init FUSE operation before init: {}", request);
                     // Send error response and return error - non-init during handshake is invalid
+                    let cookie = CancelCookie::dummy(request.unique());
                     <ReplyRaw as Reply>::new(
                         request.unique(),
                         ReplySender::Channel(self.ch.sender()),
+                        cookie,
                     )
                     .send_ll(&ResponseErrno(ll::Errno::EIO))
                     .await;
@@ -477,18 +479,28 @@ impl<FS: Filesystem> Session<FS> {
                     abi::FUSE_KERNEL_VERSION
                 );
                 let response = init.reply_version_only();
-                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
-                    .send_ll(&response)
-                    .await;
+                let cookie = CancelCookie::dummy(request.unique());
+                <ReplyRaw as Reply>::new(
+                    request.unique(),
+                    ReplySender::Channel(self.ch.sender()),
+                    cookie,
+                )
+                .send_ll(&response)
+                .await;
                 continue;
             }
 
             // We don't support ABI versions before 7.6
             if v < Version(7, 6) {
                 error!("Unsupported FUSE ABI version {v}");
-                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
-                    .send_ll(&ResponseErrno(ll::Errno::EPROTO))
-                    .await;
+                let cookie = CancelCookie::dummy(request.unique());
+                <ReplyRaw as Reply>::new(
+                    request.unique(),
+                    ReplySender::Channel(self.ch.sender()),
+                    cookie,
+                )
+                .send_ll(&ResponseErrno(ll::Errno::EPROTO))
+                .await;
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!("Unsupported FUSE ABI version {v}"),
@@ -509,9 +521,14 @@ impl<FS: Filesystem> Session<FS> {
                 .await;
             if let Err(error) = res {
                 let errno = Errno::from_i32(error.raw_os_error().unwrap_or(0));
-                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
-                    .send_ll(&ResponseErrno(errno))
-                    .await;
+                let cookie = CancelCookie::dummy(request.unique());
+                <ReplyRaw as Reply>::new(
+                    request.unique(),
+                    ReplySender::Channel(self.ch.sender()),
+                    cookie,
+                )
+                .send_ll(&ResponseErrno(errno))
+                .await;
                 return Err(error);
             }
 
@@ -556,9 +573,14 @@ impl<FS: Filesystem> Session<FS> {
             );
 
             let response = init.reply(&config);
-            <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
-                .send_ll(&response)
-                .await;
+            let cookie = CancelCookie::dummy(request.unique());
+            <ReplyRaw as Reply>::new(
+                request.unique(),
+                ReplySender::Channel(self.ch.sender()),
+                cookie,
+            )
+            .send_ll(&response)
+            .await;
 
             return Ok(());
         }
@@ -616,6 +638,7 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) thread_name: String,
     pub(crate) ch: Channel,
     pub(crate) filesystem: Arc<FilesystemHolder<FS>>,
+    pub(crate) cancel_manager: Arc<CancelManager>,
     pub(crate) allowed: SessionACL,
     pub(crate) session_owner: Uid,
     pub(crate) cancellation_token: CancellationToken,
@@ -642,8 +665,9 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
             match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                 // Dispatch request
                 Some(req) => {
+                    let cookie = CancelCookie::dummy(req.request.unique());
                     if let Ok(Operation::Destroy(_)) = req.request.operation() {
-                        req.reply::<ReplyEmpty>().ok().await;
+                        req.reply::<ReplyEmpty>(cookie).ok().await;
                         return Ok(());
                     } else {
                         req.dispatch(self).await;

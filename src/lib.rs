@@ -57,6 +57,7 @@ pub use crate::notify::PollHandle;
 pub use crate::notify::PollNotifier;
 pub use crate::passthrough::BackingId;
 pub use crate::poll_events::PollEvents;
+pub use crate::reply::InterruptibleReply;
 pub use crate::reply::ReplyAttr;
 pub use crate::reply::ReplyBmap;
 pub use crate::reply::ReplyCreate;

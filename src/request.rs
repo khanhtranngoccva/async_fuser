@@ -6,14 +6,22 @@
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
 use std::convert::TryFrom;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::sync::Weak;
+use std::time::Duration;
 
+use dashmap::DashMap;
 use log::debug;
 use log::error;
+use tokio_util::sync::CancellationToken;
 
 use crate::Filesystem;
 use crate::PollNotifier;
 use crate::RenameFlags;
+use crate::ReplyEmpty;
 use crate::Request;
+use crate::RequestId;
 use crate::channel::ChannelSender;
 use crate::forget_one::ForgetOne;
 use crate::ll;
@@ -27,6 +35,89 @@ use crate::reply::ReplyRaw;
 use crate::reply::ReplySender;
 use crate::session::SessionACL;
 use crate::session::SessionEventLoop;
+
+/// Cancel manager for requests
+#[derive(Debug)]
+pub(crate) struct CancelManager {
+    inner: Arc<CancelManagerInner>,
+}
+
+#[derive(Debug)]
+struct CancelManagerInner {
+    map: DashMap<RequestId, CancellationToken>,
+}
+
+impl CancelManager {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(CancelManagerInner {
+                map: DashMap::new(),
+            }),
+        }
+    }
+
+    fn register_cancel(&self, request_id: RequestId) -> CancelCookie {
+        let token = CancellationToken::new();
+        let old = self.inner.map.insert(request_id, token.clone());
+        assert!(
+            old.is_none(),
+            "request ID already registered, corresponding cookie should have been removed before the request completion is sent to the kernel"
+        );
+        CancelCookie {
+            request_id,
+            token,
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub(crate) async fn cancel_by_id(&self, request_id: RequestId) -> Result<(), Errno> {
+        for _ in 0..3 {
+            if let Some(token) = self.inner.map.get(&request_id).map(|token| token.clone()) {
+                // Use a cloned token to avoid holding the lock
+                token.cancel();
+                return Ok(());
+            } else {
+                // We perform 3 retries, each with a 100µs delay, before returning EAGAIN
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+        }
+        // Return EAGAIN to requeue interrupt (https://www.kernel.org/doc/html/next/filesystems/fuse.html)
+        Err(Errno::EAGAIN)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CancelCookie {
+    request_id: RequestId,
+    token: CancellationToken,
+    inner: Weak<CancelManagerInner>,
+}
+
+impl CancelCookie {
+    pub(crate) fn dummy(request_id: RequestId) -> Self {
+        Self {
+            request_id,
+            token: CancellationToken::new(),
+            inner: Weak::new(),
+        }
+    }
+}
+
+impl Deref for CancelCookie {
+    type Target = CancellationToken;
+
+    fn deref(&self) -> &Self::Target {
+        &self.token
+    }
+}
+
+impl Drop for CancelCookie {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.map.remove(&self.request_id);
+        }
+    }
+}
 
 /// Request data structure
 #[derive(Debug)]
@@ -57,12 +148,16 @@ impl<'a> RequestWithSender<'a> {
     pub(crate) async fn dispatch<FS: Filesystem>(&self, se: &SessionEventLoop<FS>) {
         debug!("{} thread={}", self.request, se.thread_name);
         match self.dispatch_req(se).await {
-            Ok(Some(resp)) => self.reply::<ReplyRaw>().send_ll(&resp).await,
+            Ok(Some(resp)) => {
+                let cookie = CancelCookie::dummy(self.request.unique());
+                let reply = self.reply::<ReplyRaw>(cookie);
+                reply.send_ll(&resp).await
+            }
             Ok(None) => {}
             Err(errno) => {
-                self.reply::<ReplyRaw>()
-                    .send_ll(&ResponseErrno(errno))
-                    .await
+                let cookie = CancelCookie::dummy(self.request.unique());
+                let reply = self.reply::<ReplyRaw>(cookie);
+                reply.send_ll(&ResponseErrno(errno)).await
             }
         }
     }
@@ -103,7 +198,11 @@ impl<'a> RequestWithSender<'a> {
         let header = self.request_header().clone();
         let nodeid = self.request.nodeid();
         let filesystem = se.filesystem.clone();
-
+        let tracker_handle = se.task_tracker.token();
+        // Prevents race conditions where task trackers are closed during dispatch
+        if tracker_handle.task_tracker().is_closed() {
+            return Err(Errno::ESHUTDOWN);
+        }
         match op {
             // Filesystem initialization - should not happen after handshake completed
             ll::Operation::Init(_) => {
@@ -114,32 +213,51 @@ impl<'a> RequestWithSender<'a> {
                 // This is handled before dispatch call.
                 return Err(Errno::EIO);
             }
-            ll::Operation::Interrupt(_) => {
-                // TODO: handle FUSE_INTERRUPT
-                return Err(Errno::ENOSYS);
+            ll::Operation::Interrupt(x) => {
+                let cancel_manager = se.cancel_manager.clone();
+                let reply = self.reply::<ReplyEmpty>(CancelCookie::dummy(self.request.unique()));
+                // Create new interrupt tasks in case more than one interrupt arrives
+                let unique = x.unique();
+                let task = se.task_tracker.track_future(async move {
+                    match cancel_manager.cancel_by_id(unique).await {
+                        Ok(()) => reply.ok().await,
+                        Err(errno) => reply.error(errno).await,
+                    }
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::interrupt")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Lookup(x) => {
                 let name = x.name().as_os_str().to_os_string();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.lookup(&header, nodeid, &name, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.lookup(&header, nodeid, &name, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::lookup")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Forget(x) => {
                 let nlookup = x.nlookup();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.forget(&header, nodeid, nlookup).await;
-                    }));
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.forget(&header, nodeid, nlookup).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::forget")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::GetAttr(_attr) => {
                 let fh = _attr.file_handle();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.getattr(&header, nodeid, fh, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.getattr(&header, nodeid, fh, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::getattr")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::SetAttr(x) => {
                 let mode = x.mode();
@@ -154,114 +272,144 @@ impl<'a> RequestWithSender<'a> {
                 let chgtime = x.chgtime();
                 let bkuptime = x.bkuptime();
                 let flags = x.flags();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .setattr(
-                                &header, nodeid, mode, uid, gid, size, atime, mtime, ctime, fh,
-                                crtime, chgtime, bkuptime, flags, reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .setattr(
+                            &header, nodeid, mode, uid, gid, size, atime, mtime, ctime, fh, crtime,
+                            chgtime, bkuptime, flags, reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::setattr")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::ReadLink(_) => {
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.readlink(&header, nodeid, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.readlink(&header, nodeid, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::readlink")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::MkNod(x) => {
                 let name = x.name().as_os_str().to_os_string();
                 let mode = x.mode();
                 let umask = x.umask();
                 let rdev = x.rdev();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .mknod(&header, nodeid, &name, mode, umask, rdev, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .mknod(&header, nodeid, &name, mode, umask, rdev, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::mknod")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::MkDir(x) => {
                 let name = x.name().as_os_str().to_os_string();
                 let mode = x.mode();
                 let umask = x.umask();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .mkdir(&header, nodeid, &name, mode, umask, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .mkdir(&header, nodeid, &name, mode, umask, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::mkdir")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Unlink(x) => {
                 let name = x.name().as_os_str().to_os_string();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.unlink(&header, nodeid, &name, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.unlink(&header, nodeid, &name, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::unlink")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::RmDir(x) => {
                 let name = x.name().as_os_str().to_os_string();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.rmdir(&header, nodeid, &name, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.rmdir(&header, nodeid, &name, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::rmdir")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::SymLink(x) => {
                 let link_name = x.link_name().as_os_str().to_os_string();
                 let target = x.target().to_owned();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .symlink(&header, nodeid, &link_name, &target, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .symlink(&header, nodeid, &link_name, &target, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::symlink")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Rename(x) => {
                 let src_name = x.src().name.as_os_str().to_os_string();
                 let dest_dir = x.dest().dir;
                 let dest_name = x.dest().name.as_os_str().to_os_string();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .rename(
-                                &header,
-                                nodeid,
-                                &src_name,
-                                dest_dir,
-                                &dest_name,
-                                RenameFlags::empty(),
-                                reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .rename(
+                            &header,
+                            nodeid,
+                            &src_name,
+                            dest_dir,
+                            &dest_name,
+                            RenameFlags::empty(),
+                            reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::rename")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Link(x) => {
                 let inode_no = x.inode_no();
                 let dest_name = x.dest().name.as_os_str().to_os_string();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .link(&header, inode_no, nodeid, &dest_name, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .link(&header, inode_no, nodeid, &dest_name, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::link")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Open(x) => {
                 let flags = x.flags();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.open(&header, nodeid, flags, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.open(&header, nodeid, flags, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::open")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Read(x) => {
                 let file_handle = x.file_handle();
@@ -269,22 +417,25 @@ impl<'a> RequestWithSender<'a> {
                 let size = x.size();
                 let flags = x.flags();
                 let lock_owner = x.lock_owner();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .read(
-                                &header,
-                                nodeid,
-                                file_handle,
-                                offset,
-                                size,
-                                flags,
-                                lock_owner,
-                                reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .read(
+                            &header,
+                            nodeid,
+                            file_handle,
+                            offset,
+                            size,
+                            flags,
+                            lock_owner,
+                            reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::read")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Write(x) => {
                 let file_handle = x.file_handle();
@@ -294,118 +445,146 @@ impl<'a> RequestWithSender<'a> {
                 let write_flags = x.write_flags();
                 let flags = x.flags();
                 let lock_owner = x.lock_owner();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .write(
-                                &header,
-                                nodeid,
-                                file_handle,
-                                offset,
-                                &data,
-                                write_flags,
-                                flags,
-                                lock_owner,
-                                reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .write(
+                            &header,
+                            nodeid,
+                            file_handle,
+                            offset,
+                            &data,
+                            write_flags,
+                            flags,
+                            lock_owner,
+                            reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::write")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Flush(x) => {
                 let file_handle = x.file_handle();
                 let lock_owner = x.lock_owner();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .flush(&header, nodeid, file_handle, lock_owner, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .flush(&header, nodeid, file_handle, lock_owner, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::flush")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Release(x) => {
                 let file_handle = x.file_handle();
                 let flags = x.flags();
                 let lock_owner = x.lock_owner();
                 let flush = x.flush();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .release(
-                                &header,
-                                nodeid,
-                                file_handle,
-                                flags,
-                                lock_owner,
-                                flush,
-                                reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .release(
+                            &header,
+                            nodeid,
+                            file_handle,
+                            flags,
+                            lock_owner,
+                            flush,
+                            reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::release")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::FSync(x) => {
                 let file_handle = x.file_handle();
                 let datasync = x.fdatasync();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .fsync(&header, nodeid, file_handle, datasync, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .fsync(&header, nodeid, file_handle, datasync, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::fsync")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::OpenDir(x) => {
                 let flags = x.flags();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.opendir(&header, nodeid, flags, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.opendir(&header, nodeid, flags, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::opendir")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::ReadDir(x) => {
                 let file_handle = x.file_handle();
                 let offset = x.offset();
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
                 let reply = ReplyDirectory::new(
                     self.request.unique(),
                     ReplySender::Channel(self.ch.clone()),
                     x.size() as usize,
+                    cancel_cookie,
                 );
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .readdir(&header, nodeid, file_handle, offset, reply)
-                            .await;
-                    }));
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .readdir(&header, nodeid, file_handle, offset, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::readdir")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::ReleaseDir(x) => {
                 let file_handle = x.file_handle();
                 let flags = x.flags();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .releasedir(&header, nodeid, file_handle, flags, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .releasedir(&header, nodeid, file_handle, flags, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::releasedir")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::FSyncDir(x) => {
                 let file_handle = x.file_handle();
                 let datasync = x.fdatasync();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .fsyncdir(&header, nodeid, file_handle, datasync, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .fsyncdir(&header, nodeid, file_handle, datasync, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::fsyncdir")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::StatFs(_) => {
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.statfs(&header, nodeid, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.statfs(&header, nodeid, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::statfs")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::SetXAttr(x) => {
                 let name = x.name().to_os_string();
@@ -413,61 +592,79 @@ impl<'a> RequestWithSender<'a> {
                 let value = x.value().to_vec();
                 let flags = x.flags();
                 let position = x.position();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .setxattr(&header, nodeid, &name, &value, flags, position, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .setxattr(&header, nodeid, &name, &value, flags, position, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::setxattr")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::GetXAttr(x) => {
                 let name = x.name().to_os_string();
                 let size = x.size_u32();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .getxattr(&header, nodeid, &name, size, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .getxattr(&header, nodeid, &name, size, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::getxattr")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::ListXAttr(x) => {
                 let size = x.size();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.listxattr(&header, nodeid, size, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.listxattr(&header, nodeid, size, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::listxattr")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::RemoveXAttr(x) => {
                 let name = x.name().to_os_string();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.removexattr(&header, nodeid, &name, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.removexattr(&header, nodeid, &name, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::removexattr")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Access(x) => {
                 let mask = x.mask();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.access(&header, nodeid, mask, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.access(&header, nodeid, mask, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::access")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Create(x) => {
                 let name = x.name().as_os_str().to_os_string();
                 let mode = x.mode();
                 let umask = x.umask();
                 let flags = x.flags();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .create(&header, nodeid, &name, mode, umask, flags, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .create(&header, nodeid, &name, mode, umask, flags, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::create")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::GetLk(x) => {
                 let file_handle = x.file_handle();
@@ -476,23 +673,26 @@ impl<'a> RequestWithSender<'a> {
                 let end = x.lock().range.1;
                 let typ = x.lock().typ;
                 let pid = x.lock().pid;
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .getlk(
-                                &header,
-                                nodeid,
-                                file_handle,
-                                lock_owner,
-                                start,
-                                end,
-                                typ,
-                                pid,
-                                reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .getlk(
+                            &header,
+                            nodeid,
+                            file_handle,
+                            lock_owner,
+                            start,
+                            end,
+                            typ,
+                            pid,
+                            reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::getlk")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::SetLk(x) => {
                 let file_handle = x.file_handle();
@@ -502,35 +702,41 @@ impl<'a> RequestWithSender<'a> {
                 let typ = x.lock().typ;
                 let pid = x.lock().pid;
                 let sleep = x.sleep();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .setlk(
-                                &header,
-                                nodeid,
-                                file_handle,
-                                lock_owner,
-                                start,
-                                end,
-                                typ,
-                                pid,
-                                sleep,
-                                reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .setlk(
+                            &header,
+                            nodeid,
+                            file_handle,
+                            lock_owner,
+                            start,
+                            end,
+                            typ,
+                            pid,
+                            sleep,
+                            reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::setlk")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::BMap(x) => {
                 let block_size = x.block_size();
                 let block = x.block();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .bmap(&header, nodeid, block_size, block, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .bmap(&header, nodeid, block_size, block, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::bmap")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::IoCtl(x) => {
                 if x.unrestricted() {
@@ -542,35 +748,41 @@ impl<'a> RequestWithSender<'a> {
                 // TODO: consider using a buffer pool
                 let in_data = x.in_data().to_vec();
                 let out_size = x.out_size();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .ioctl(
-                                &header,
-                                nodeid,
-                                file_handle,
-                                flags,
-                                command,
-                                &in_data,
-                                out_size,
-                                reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .ioctl(
+                            &header,
+                            nodeid,
+                            file_handle,
+                            flags,
+                            command,
+                            &in_data,
+                            out_size,
+                            reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::ioctl")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Poll(x) => {
                 let file_handle = x.file_handle();
                 let ph = PollNotifier::new(se.ch.sender(), x.kernel_handle());
                 let events = x.events();
                 let flags = x.flags();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .poll(&header, nodeid, file_handle, ph, events, flags, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .poll(&header, nodeid, file_handle, ph, events, flags, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::poll")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::NotifyReply(_) => {
                 // TODO: handle FUSE_NOTIFY_REPLY
@@ -578,39 +790,48 @@ impl<'a> RequestWithSender<'a> {
             }
             ll::Operation::BatchForget(x) => {
                 let nodes: Vec<ForgetOne> = ForgetOne::vec_from_inner(x.nodes());
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.batch_forget(&header, &nodes).await;
-                    }));
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.batch_forget(&header, &nodes).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::batch_forget")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::FAllocate(x) => {
                 let file_handle = x.file_handle();
                 let offset = x.offset()?;
                 let len = x.len()?;
                 let mode = x.mode();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .fallocate(&header, nodeid, file_handle, offset, len, mode, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .fallocate(&header, nodeid, file_handle, offset, len, mode, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::fallocate")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::ReadDirPlus(x) => {
                 let file_handle = x.file_handle();
                 let offset = x.offset();
                 let size = x.size();
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
                 let reply = ReplyDirectoryPlus::new(
                     self.request.unique(),
                     ReplySender::Channel(self.ch.clone()),
                     size as usize,
+                    cancel_cookie,
                 );
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .readdirplus(&header, nodeid, file_handle, offset, reply)
-                            .await;
-                    }));
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .readdirplus(&header, nodeid, file_handle, offset, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::readdirplus")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Rename2(x) => {
                 let from_dir = x.from().dir;
@@ -618,67 +839,82 @@ impl<'a> RequestWithSender<'a> {
                 let to_dir = x.to().dir;
                 let to_name = x.to().name.as_os_str().to_os_string();
                 let flags = x.flags();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .rename(
-                                &header, from_dir, &from_name, to_dir, &to_name, flags, reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .rename(
+                            &header, from_dir, &from_name, to_dir, &to_name, flags, reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::rename")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::Lseek(x) => {
                 let file_handle = x.file_handle();
                 let offset = x.offset();
                 let whence = x.whence();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .lseek(&header, nodeid, file_handle, offset, whence, reply)
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .lseek(&header, nodeid, file_handle, offset, whence, reply)
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::lseek")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::CopyFileRange(x) => {
                 let (i, o) = (x.src()?, x.dest()?);
                 let len = x.len();
                 let flags = x.flags();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .copy_file_range(
-                                &header,
-                                i.inode,
-                                i.file_handle,
-                                i.offset,
-                                o.inode,
-                                o.file_handle,
-                                o.offset,
-                                len,
-                                flags,
-                                reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .copy_file_range(
+                            &header,
+                            i.inode,
+                            i.file_handle,
+                            i.offset,
+                            o.inode,
+                            o.file_handle,
+                            o.offset,
+                            len,
+                            flags,
+                            reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::copy_file_range")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::SetVolName(x) => {
                 let name = x.name().as_os_str().to_os_string();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.setvolname(&header, &name, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.setvolname(&header, &name, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::setvolname")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes(x) => {
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem.getxtimes(&header, nodeid, reply).await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem.getxtimes(&header, nodeid, reply).await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::getxtimes")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange(x) => {
@@ -687,15 +923,18 @@ impl<'a> RequestWithSender<'a> {
                 let to_dir = x.to().dir;
                 let to_name = x.to().name.as_os_str().to_os_string();
                 let options = x.options();
-                let reply = self.reply();
-                se.handler_runtime
-                    .spawn(se.task_tracker.track_future(async move {
-                        filesystem
-                            .exchange(
-                                &header, from_dir, &from_name, to_dir, &to_name, options, reply,
-                            )
-                            .await;
-                    }));
+                let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
+                let reply = self.reply(cancel_cookie);
+                let task = se.task_tracker.track_future(async move {
+                    filesystem
+                        .exchange(
+                            &header, from_dir, &from_name, to_dir, &to_name, options, reply,
+                        )
+                        .await;
+                });
+                tokio::task::Builder::new()
+                    .name("async_fuser::handler::exchange")
+                    .spawn_on(task, se.handler_runtime.handle())?;
             }
             ll::Operation::CuseInit(_) => {
                 // TODO: handle CUSE_INIT
@@ -707,8 +946,12 @@ impl<'a> RequestWithSender<'a> {
 
     /// Create a reply object for this request that can be passed to the filesystem
     /// implementation and makes sure that a request is replied exactly once
-    pub(crate) fn reply<T: Reply>(&self) -> T {
-        Reply::new(self.request.unique(), ReplySender::Channel(self.ch.clone()))
+    pub(crate) fn reply<T: Reply>(&self, cancel_cookie: CancelCookie) -> T {
+        Reply::new(
+            self.request.unique(),
+            ReplySender::Channel(self.ch.clone()),
+            cancel_cookie,
+        )
     }
 
     /// Returns a Request reference for this request

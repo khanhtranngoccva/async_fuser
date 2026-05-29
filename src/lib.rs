@@ -77,6 +77,7 @@ pub use crate::reply::ReplyXattr;
 pub use crate::request_param::Request;
 pub use crate::session::BackgroundSession;
 use crate::session::MAX_WRITE_SIZE;
+pub use crate::session::RuntimeStrategy;
 pub use crate::session::Session;
 pub use crate::session::SessionACL;
 pub use crate::session::SessionUnmounter;

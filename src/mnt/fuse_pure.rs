@@ -65,7 +65,7 @@ pub(crate) struct MountImpl {
 #[derive(Debug)]
 struct MountState {
     mountpoint: PathBuf,
-    #[allow(dead_code)]
+    #[allow(unused)]
     auto_unmount_socket: Option<UnixStream>,
     fuse_device: Arc<DevFuse>,
 }

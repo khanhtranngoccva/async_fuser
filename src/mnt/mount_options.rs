@@ -1,21 +1,17 @@
+use crate::{SessionACL, session::RuntimeStrategy};
 use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
 
-use crate::SessionACL;
-
 /// Fuser session configuration, including mount options.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Mount options.
     pub mount_options: Vec<MountOption>,
     /// Who can access the filesystem.
     pub acl: SessionACL,
-    /// Number of event loop workers that will be spawned on the managed runtime. Each worker will have its own task and event loop, and possibly its own file descriptor if clone_fd is set.
-    pub n_event_loop_workers: Option<usize>,
-    /// Number of handler workers to spawn on the managed runtime.
-    pub n_handler_workers: Option<usize>,
+    /// Runtime strategy to use.
+    pub runtime_strategy: RuntimeStrategy,
     /// Use `FUSE_DEV_IOC_CLONE` to give each worker thread its own fd.
     /// This enables more efficient request processing
     /// when multiple threads are used. Requires Linux 4.5+.

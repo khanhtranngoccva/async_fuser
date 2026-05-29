@@ -71,7 +71,6 @@ impl DerefMut for DevFuse {
 impl DevFuse {
     pub(crate) const PATH: &'static str = "/dev/fuse";
 
-    #[allow(dead_code)]
     pub(crate) async fn open() -> io::Result<Self> {
         // TODO: make this configurable
         let client = Arc::new(Client::build(UringCfg::default()).map_err(io::Error::other)?);
@@ -89,7 +88,6 @@ impl DevFuse {
         Ok(Self { client, file })
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn try_from_fd(fd: OwnedFd) -> io::Result<Self> {
         let client = Arc::new(Client::build(UringCfg::default()).map_err(io::Error::other)?);
         let mut file = client
@@ -101,7 +99,6 @@ impl DevFuse {
         Ok(Self { client, file })
     }
 
-    #[allow(dead_code)]
     #[cfg(target_os = "linux")]
     pub(crate) async fn clone_fd(&self) -> io::Result<Self> {
         let client = self.client.clone();

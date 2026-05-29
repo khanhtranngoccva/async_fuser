@@ -9,12 +9,15 @@ use libc::ENODEV;
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
+use std::num::NonZero;
 use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::runtime::Handle;
+use tokio::runtime::RuntimeFlavor;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -79,11 +82,114 @@ impl SessionACL {
     /// Returns the mount option string for kernel/fusermount/libfuse paths.
     /// Both `All` and `RootAndOwner` map to `allow_other` - the kernel only
     /// understands `allow_other`, and fuser enforces the root-only restriction internally.
-    #[allow(dead_code)]
+    #[allow(unused)]
     pub(crate) fn to_mount_option(self) -> Option<&'static str> {
         match self {
             SessionACL::All | SessionACL::RootAndOwner => Some("allow_other"),
             SessionACL::Owner => None,
+        }
+    }
+}
+
+/// Runtime strategy for the session. Controls how internal tasks are spawned.
+///
+/// In the optimal scenario, it tries to use the current thread's runtime handle if it is a multi-threaded runtime. Otherwise, it will use a managed strategy. However, applications should manually configure this enum to avoid unpredictable behavior.
+#[derive(Debug, Clone)]
+pub enum RuntimeStrategy {
+    /// Use a caller-managed handle to spawn the session. This is the recommended option because it allows scaling to multiple filesystems without risk of thread oversubscription.
+    ///
+    /// The handle must point to a multi-threaded Tokio runtime to avoid a deadlock. Passing a current-thread handle will return an error.
+    Unmanaged {
+        /// Number of event loop workers to spawn on the runtime. 1 worker per filesystem is by default.
+        n_event_loop_workers: Option<NonZero<usize>>,
+        /// Handle to the runtime to use.
+        handle: tokio::runtime::Handle,
+    },
+    /// Spawn a managed runtime for the session. This option is not recommended because it causes thread oversubscription if multiple filesystems are used.
+    Managed {
+        /// Number of event loop workers to spawn on the runtime. 1 worker per filesystem is by default.
+        n_event_loop_workers: Option<NonZero<usize>>,
+        /// Number of handler workers to spawn on the runtime. 1 worker per filesystem is by default.
+        n_handler_workers: Option<NonZero<usize>>,
+    },
+}
+
+impl Default for RuntimeStrategy {
+    fn default() -> Self {
+        let handle = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = handle
+            && handle.runtime_flavor() == RuntimeFlavor::MultiThread
+        {
+            RuntimeStrategy::Unmanaged {
+                n_event_loop_workers: None,
+                handle,
+            }
+        } else {
+            log::warn!(
+                "cannot automatically pick a multi-threaded runtime handle, falling back to managed strategy"
+            );
+            RuntimeStrategy::Managed {
+                n_event_loop_workers: None,
+                n_handler_workers: std::thread::available_parallelism().ok(),
+            }
+        }
+    }
+}
+
+impl RuntimeStrategy {
+    /// Verify that the runtime strategy is valid.
+    pub(crate) fn verify(&self) -> Result<(), io::Error> {
+        if !cfg!(target_os = "linux") && self.event_loop_workers().get() != 1 {
+            return Err(io::Error::other(
+                "n_event_loop_workers != 1 is only supported on Linux",
+            ));
+        }
+        match self {
+            RuntimeStrategy::Unmanaged { handle, .. } => {
+                if handle.runtime_flavor() != RuntimeFlavor::MultiThread {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unmanaged runtime strategy must be used with a multi-threaded runtime",
+                    ));
+                }
+            }
+            RuntimeStrategy::Managed { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Get the number of event loop workers for the runtime strategy.
+    pub(crate) fn event_loop_workers(&self) -> NonZero<usize> {
+        match self {
+            RuntimeStrategy::Unmanaged {
+                n_event_loop_workers,
+                ..
+            } => n_event_loop_workers.unwrap_or(NonZero::new(1).unwrap()),
+            RuntimeStrategy::Managed {
+                n_event_loop_workers,
+                ..
+            } => n_event_loop_workers.unwrap_or(NonZero::new(1).unwrap()),
+        }
+    }
+
+    /// Build the managed runtime for the runtime strategy if necessary and return a valid handle to a multi-threaded runtime.
+    pub(crate) fn build(&self) -> Result<(Handle, Option<DroppableRuntime>), io::Error> {
+        match self {
+            RuntimeStrategy::Unmanaged { handle, .. } => Ok((handle.clone(), None)),
+            RuntimeStrategy::Managed {
+                n_event_loop_workers,
+                n_handler_workers,
+                ..
+            } => {
+                let n_event_loop_workers = n_event_loop_workers.map(NonZero::get).unwrap_or(1);
+                let n_handler_workers = n_handler_workers.map(NonZero::get).unwrap_or(1);
+                let runtime = DroppableRuntime::new(
+                    "afuser-hnd",
+                    n_event_loop_workers + n_handler_workers,
+                    false,
+                )?;
+                Ok((runtime.handle().clone(), Some(runtime)))
+            }
         }
     }
 }
@@ -171,8 +277,14 @@ pub struct Session<FS: Filesystem> {
     /// FUSE protocol version, as reported by the kernel.
     /// The field is set to `Some` when the init message is received.
     pub(crate) proto_version: Option<Version>,
+    /// Configuration for the session
     pub(crate) config: Config,
+    /// CancellationToken for the session. When the token is triggered, all event loops terminate.
     pub(crate) cancellation_token: CancellationToken,
+    /// Handle to the runtime for the session.
+    pub(crate) handle: Handle,
+    /// Managed runtime for the session.
+    pub(crate) managed_runtime: Option<DroppableRuntime>,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -191,22 +303,13 @@ impl<FS: Filesystem> Session<FS> {
         options: &Config,
     ) -> io::Result<Session<FS>> {
         check_option_conflicts(options)?;
-        if let Some(n_handler_workers) = options.n_handler_workers
-            && n_handler_workers == 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "n_handler_workers must be greater than 0",
-            ));
-        }
-        if let Some(n_event_loop_workers) = options.n_event_loop_workers
-            && n_event_loop_workers == 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "n_event_loop_workers must be greater than 0",
-            ));
-        }
+        options.runtime_strategy.verify()?;
+
+        // Ensure the internal dependencies are ready first.
+        let token = CancellationToken::new();
+        let (handle, managed_runtime) = options.runtime_strategy.build()?;
+
+        // Perform the mount.
         let mountpoint = mountpoint.as_ref();
         info!("Mounting {}", mountpoint.display());
         // If AutoUnmount is requested, but not AllowRoot or AllowOther, return an error
@@ -220,9 +323,7 @@ impl<FS: Filesystem> Session<FS> {
             ));
         }
         let (file, mount) = Mount::new(mountpoint, &options.mount_options, options.acl).await?;
-
         let ch = Channel::new(file);
-        let token = CancellationToken::new();
 
         let mut session = Session {
             filesystem: FilesystemHolder::new(filesystem),
@@ -234,32 +335,20 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: None,
             config: options.clone(),
             cancellation_token: token,
+            handle,
+            managed_runtime,
         };
 
         session.handshake().await?;
-
         Ok(session)
     }
 
     /// Wrap an existing /dev/fuse file descriptor. This doesn't mount the
     /// filesystem anywhere; that must be done separately.
     pub async fn from_fd(filesystem: FS, fd: OwnedFd, config: Config) -> io::Result<Self> {
-        if let Some(n_handler_workers) = config.n_handler_workers
-            && n_handler_workers == 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "n_handler_workers must be greater than 0",
-            ));
-        }
-        if let Some(n_event_loop_workers) = config.n_event_loop_workers
-            && n_event_loop_workers == 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "n_event_loop_workers must be greater than 0",
-            ));
-        }
+        config.runtime_strategy.verify()?;
+        let (handle, managed_runtime) = config.runtime_strategy.build()?;
+
         let ch = Channel::new(Arc::new(DevFuse::try_from_fd(fd).await?));
         let mut session = Session {
             filesystem: FilesystemHolder::new(filesystem),
@@ -271,6 +360,8 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: None,
             config,
             cancellation_token: CancellationToken::new(),
+            handle,
+            managed_runtime,
         };
         session.handshake().await?;
         Ok(session)
@@ -278,20 +369,17 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the given session ends.
-    pub fn spawn(mut self) -> io::Result<BackgroundSession> {
+    pub fn spawn(self) -> io::Result<BackgroundSession> {
         let sender = self.ch.sender();
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *self.mount.mount.lock());
-        let cloned_token = self.cancellation_token;
-        self.cancellation_token = cloned_token.child_token();
-        let host_runtime = DroppableRuntime::new("afuser-tmp", 1, false)?;
-        let guard = host_runtime.spawn(self.run_internal());
+        // Spawn the session loop in a background thread.
+        let handle = self.handle.clone();
+        let guard = handle.spawn(self.run_internal());
         Ok(BackgroundSession {
             guard: Some(guard),
             sender,
             mount,
-            _runtime: host_runtime,
-            _cancellation_token: cloned_token,
         })
     }
 
@@ -305,35 +393,17 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: _,
             config,
             cancellation_token,
+            handle,
+            managed_runtime,
         } = self;
 
-        let n_event_loop_workers = config.n_event_loop_workers.unwrap_or(1);
-        let n_handler_workers = config.n_handler_workers.unwrap_or(1);
-        let runtime = Arc::new(DroppableRuntime::new(
-            "afuser-hnd",
-            n_event_loop_workers + n_handler_workers,
-            true,
-        )?);
-        log::info!(
-            "Spawning FUSE session with {} event loop workers and {} handler workers",
-            n_event_loop_workers,
-            n_handler_workers
-        );
-        let task_tracker = TaskTracker::new();
-
-        if !cfg!(target_os = "linux") && n_event_loop_workers != 1 {
-            // TODO: check whether it works on macOS/FreeBSD and enable if it works.
-            return Err(io::Error::other("n_tasks != 1 is only supported on Linux"));
-        }
-
-        let Some(n_tasks_minus_one) = n_event_loop_workers.checked_sub(1) else {
-            return Err(io::Error::other("n_tasks"));
-        };
-
+        let handler_task_tracker = TaskTracker::new();
+        let mut event_loop_tasks = JoinSet::new();
         let mut filesystem = Arc::new(filesystem);
-        let mut channels = Vec::with_capacity(n_event_loop_workers);
 
-        for _ in 0..n_tasks_minus_one {
+        let n_event_loop_workers = config.runtime_strategy.event_loop_workers().get();
+        let mut channels = Vec::with_capacity(n_event_loop_workers);
+        for _ in 0..n_event_loop_workers - 1 {
             if config.clone_fd {
                 #[cfg(target_os = "linux")]
                 {
@@ -349,7 +419,7 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
         channels.push(primary_channel);
-        let mut tasks = JoinSet::new();
+
         let cancel_manager = Arc::new(CancelManager::new());
 
         for (i, ch) in channels.into_iter().enumerate() {
@@ -361,21 +431,19 @@ impl<FS: Filesystem> Session<FS> {
                 allowed: config.acl,
                 session_owner,
                 cancellation_token: cancellation_token.child_token(),
-                handler_runtime: runtime.clone(),
-                task_tracker: task_tracker.clone(),
+                handler_runtime: handle.clone(),
+                task_tracker: handler_task_tracker.clone(),
                 cancel_manager: cancel_manager.clone(),
             };
-            tasks
+            event_loop_tasks
                 .build_task()
                 .name("async_fuser::event_loop")
-                .spawn_on(
-                    async move { event_loop.event_loop().await },
-                    runtime.handle(),
-                )?;
+                .spawn_on(async move { event_loop.event_loop().await }, &handle)?;
         }
 
+        // Wait until all event loop tasks are completed.
         let mut reply: io::Result<()> = Ok(());
-        while let Some(result) = tasks.join_next().await {
+        while let Some(result) = event_loop_tasks.join_next().await {
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -389,9 +457,9 @@ impl<FS: Filesystem> Session<FS> {
         }
 
         // Wait until all tasks spawned by the event loop and handler runtime are completed.
-        task_tracker.close();
-        task_tracker.wait().await;
-        drop(runtime);
+        handler_task_tracker.close();
+        handler_task_tracker.wait().await;
+        drop(managed_runtime);
 
         // Destroy the filesystem.
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
@@ -399,7 +467,6 @@ impl<FS: Filesystem> Session<FS> {
                 "BUG: must have one refcount for filesystem",
             ));
         };
-
         filesystem.destroy();
 
         reply
@@ -642,7 +709,7 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) allowed: SessionACL,
     pub(crate) session_owner: Uid,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) handler_runtime: Arc<DroppableRuntime>,
+    pub(crate) handler_runtime: Handle,
     pub(crate) task_tracker: TaskTracker,
 }
 
@@ -690,14 +757,10 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
 pub struct BackgroundSession {
     /// Thread guard of the background session
     pub guard: Option<JoinHandle<io::Result<()>>>,
-    /// Runtime for the background session, which hosts a single task that runs the session loop.
-    _runtime: DroppableRuntime,
     /// Object for creating Notifiers for client use
     sender: ChannelSender,
     /// Ensures the filesystem is unmounted when the session ends
     mount: Option<Mount>,
-    /// CancellationToken for the background session
-    _cancellation_token: CancellationToken,
 }
 
 impl BackgroundSession {
@@ -759,7 +822,7 @@ impl Drop for BackgroundSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, Filesystem, Session};
+    use crate::{Config, Filesystem, Session, session::RuntimeStrategy};
 
     struct DummyFS {}
 
@@ -801,5 +864,33 @@ mod tests {
 
         // Unmount the session using sync mode in a current thread runtime to simulate the function being called from a Drop impl, should not deadlock with internal tasks
         drop(bg_session);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_runtime_strategy_in_current_thread_context() {
+        let strategy = RuntimeStrategy::default();
+        assert!(strategy.verify().is_ok());
+        assert!(matches!(
+            strategy,
+            RuntimeStrategy::Managed {
+                n_event_loop_workers: None,
+                n_handler_workers,
+            } if n_handler_workers == std::thread::available_parallelism().ok(),
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test_log::test]
+    async fn test_runtime_strategy_in_multi_thread_context() {
+        let strategy = RuntimeStrategy::default();
+        assert!(strategy.verify().is_ok());
+        assert!(matches!(
+            strategy,
+            RuntimeStrategy::Unmanaged {
+                n_event_loop_workers: None,
+                handle,
+            } if handle.metrics().num_workers() == 4
+        ));
     }
 }

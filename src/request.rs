@@ -226,7 +226,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::interrupt")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Lookup(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -237,7 +237,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::lookup")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Forget(x) => {
                 let nlookup = x.nlookup();
@@ -246,7 +246,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::forget")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::GetAttr(_attr) => {
                 let fh = _attr.file_handle();
@@ -257,7 +257,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::getattr")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::SetAttr(x) => {
                 let mode = x.mode();
@@ -284,7 +284,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::setattr")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::ReadLink(_) => {
                 let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
@@ -294,7 +294,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::readlink")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::MkNod(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -310,7 +310,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::mknod")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::MkDir(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -325,7 +325,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::mkdir")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Unlink(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -336,7 +336,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::unlink")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::RmDir(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -347,7 +347,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::rmdir")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::SymLink(x) => {
                 let link_name = x.link_name().as_os_str().to_os_string();
@@ -361,7 +361,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::symlink")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Rename(x) => {
                 let src_name = x.src().name.as_os_str().to_os_string();
@@ -384,7 +384,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::rename")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Link(x) => {
                 let inode_no = x.inode_no();
@@ -398,7 +398,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::link")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Open(x) => {
                 let flags = x.flags();
@@ -409,7 +409,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::open")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Read(x) => {
                 let file_handle = x.file_handle();
@@ -435,7 +435,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::read")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Write(x) => {
                 let file_handle = x.file_handle();
@@ -464,7 +464,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::write")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Flush(x) => {
                 let file_handle = x.file_handle();
@@ -478,7 +478,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::flush")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Release(x) => {
                 let file_handle = x.file_handle();
@@ -502,7 +502,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::release")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::FSync(x) => {
                 let file_handle = x.file_handle();
@@ -516,7 +516,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::fsync")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::OpenDir(x) => {
                 let flags = x.flags();
@@ -527,7 +527,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::opendir")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::ReadDir(x) => {
                 let file_handle = x.file_handle();
@@ -546,7 +546,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::readdir")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::ReleaseDir(x) => {
                 let file_handle = x.file_handle();
@@ -560,7 +560,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::releasedir")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::FSyncDir(x) => {
                 let file_handle = x.file_handle();
@@ -574,7 +574,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::fsyncdir")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::StatFs(_) => {
                 let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
@@ -584,7 +584,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::statfs")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::SetXAttr(x) => {
                 let name = x.name().to_os_string();
@@ -601,7 +601,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::setxattr")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::GetXAttr(x) => {
                 let name = x.name().to_os_string();
@@ -615,7 +615,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::getxattr")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::ListXAttr(x) => {
                 let size = x.size();
@@ -626,7 +626,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::listxattr")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::RemoveXAttr(x) => {
                 let name = x.name().to_os_string();
@@ -637,7 +637,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::removexattr")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Access(x) => {
                 let mask = x.mask();
@@ -648,7 +648,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::access")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Create(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -664,7 +664,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::create")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::GetLk(x) => {
                 let file_handle = x.file_handle();
@@ -692,7 +692,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::getlk")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::SetLk(x) => {
                 let file_handle = x.file_handle();
@@ -722,7 +722,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::setlk")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::BMap(x) => {
                 let block_size = x.block_size();
@@ -736,7 +736,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::bmap")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::IoCtl(x) => {
                 if x.unrestricted() {
@@ -766,7 +766,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::ioctl")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Poll(x) => {
                 let file_handle = x.file_handle();
@@ -782,7 +782,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::poll")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::NotifyReply(_) => {
                 // TODO: handle FUSE_NOTIFY_REPLY
@@ -795,7 +795,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::batch_forget")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::FAllocate(x) => {
                 let file_handle = x.file_handle();
@@ -811,7 +811,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::fallocate")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::ReadDirPlus(x) => {
                 let file_handle = x.file_handle();
@@ -831,7 +831,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::readdirplus")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Rename2(x) => {
                 let from_dir = x.from().dir;
@@ -850,7 +850,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::rename")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::Lseek(x) => {
                 let file_handle = x.file_handle();
@@ -865,7 +865,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::lseek")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::CopyFileRange(x) => {
                 let (i, o) = (x.src()?, x.dest()?);
@@ -891,7 +891,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::copy_file_range")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::SetVolName(x) => {
@@ -903,7 +903,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::setvolname")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes(x) => {
@@ -914,7 +914,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::getxtimes")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange(x) => {
@@ -934,7 +934,7 @@ impl<'a> RequestWithSender<'a> {
                 });
                 tokio::task::Builder::new()
                     .name("async_fuser::handler::exchange")
-                    .spawn_on(task, se.handler_runtime.handle())?;
+                    .spawn_on(task, &se.handler_runtime)?;
             }
             ll::Operation::CuseInit(_) => {
                 // TODO: handle CUSE_INIT

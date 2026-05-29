@@ -797,6 +797,23 @@ impl BackgroundSession {
         })
     }
 
+    /// Unmount with the detached flag, and retrieve the inner join handle so that cleanup tasks may wait on it.
+    #[cfg(target_os = "linux")]
+    pub async fn umount_and_detach(mut self) -> Result<JoinHandle<io::Result<()>>, io::Error> {
+        if let Some(mount) = self.mount.take() {
+            match mount.umount(&[UnmountOption::Detach]).await {
+                Ok(()) => {}
+                Err((mount, error)) => {
+                    self.mount = mount;
+                    return Err(error);
+                }
+            }
+        }
+        self.guard
+            .take()
+            .ok_or_else(|| io::Error::other("FUSE session guard not found"))
+    }
+
     /// Returns an object that can be used to send notifications to the kernel
     pub fn notifier(&self) -> Notifier {
         Notifier::new(self.sender.clone())

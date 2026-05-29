@@ -394,7 +394,7 @@ impl<FS: Filesystem> Session<FS> {
             config,
             cancellation_token,
             handle,
-            managed_runtime,
+            managed_runtime: _managed_runtime,
         } = self;
 
         let handler_task_tracker = TaskTracker::new();
@@ -459,7 +459,6 @@ impl<FS: Filesystem> Session<FS> {
         // Wait until all tasks spawned by the event loop and handler runtime are completed.
         handler_task_tracker.close();
         handler_task_tracker.wait().await;
-        drop(managed_runtime);
 
         // Destroy the filesystem.
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
@@ -469,6 +468,7 @@ impl<FS: Filesystem> Session<FS> {
         };
         filesystem.destroy();
 
+        // Bootstrap runtime can be destroyed here, and the task will not be canceled because there is no longer an await point.
         reply
     }
 
@@ -815,7 +815,12 @@ impl BackgroundSession {
 impl Drop for BackgroundSession {
     fn drop(&mut self) {
         runtime::execute_future_from_sync(async move {
-            self._umount_and_join(drop_umount_flags()).await.unwrap()
+            let _ = self
+                ._umount_and_join(drop_umount_flags())
+                .await
+                .inspect_err(|e| {
+                    log::error!("Error unmounting filesystem: {e}");
+                });
         });
     }
 }

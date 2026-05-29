@@ -138,7 +138,7 @@ impl Default for RuntimeStrategy {
 
 impl RuntimeStrategy {
     /// Verify that the runtime strategy is valid.
-    pub(crate) fn verify(&self) -> Result<(), io::Error> {
+    pub fn verify(&self) -> Result<(), io::Error> {
         if !cfg!(target_os = "linux") && self.event_loop_workers().get() != 1 {
             return Err(io::Error::other(
                 "n_event_loop_workers != 1 is only supported on Linux",

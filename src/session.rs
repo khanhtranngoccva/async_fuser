@@ -125,9 +125,6 @@ impl Default for RuntimeStrategy {
                 handle,
             }
         } else {
-            log::warn!(
-                "cannot automatically pick a multi-threaded runtime handle, falling back to managed strategy"
-            );
             RuntimeStrategy::Managed {
                 n_event_loop_workers: None,
                 n_handler_workers: std::thread::available_parallelism().ok(),
@@ -375,9 +372,11 @@ impl<FS: Filesystem> Session<FS> {
         let mount = std::mem::take(&mut *self.mount.mount.lock());
         // Spawn the session loop in a background thread.
         let handle = self.handle.clone();
-        let guard = handle.spawn(self.run_internal());
+        let task = tokio::task::Builder::new()
+            .name("async_fuser::background")
+            .spawn_on(self.run_internal(), &handle)?;
         Ok(BackgroundSession {
-            guard: Some(guard),
+            guard: Some(task),
             sender,
             mount,
         })
@@ -844,11 +843,21 @@ impl Drop for BackgroundSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, Filesystem, Session, session::RuntimeStrategy};
+    use std::num::NonZero;
+
+    use tokio::{fs::File, runtime::Runtime};
+
+    use crate::{Config, Filesystem, Session, SessionACL, session::RuntimeStrategy};
 
     struct DummyFS {}
 
     impl Filesystem for DummyFS {}
+
+    #[rstest::fixture]
+    #[once]
+    fn shared_runtime() -> Runtime {
+        Runtime::new().unwrap()
+    }
 
     #[tokio::test]
     #[test_log::test]
@@ -914,5 +923,31 @@ mod tests {
                 handle,
             } if handle.metrics().num_workers() == 4
         ));
+    }
+
+    #[test_log::test(rstest::rstest)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_shared_rt_thread_leak_with_clone_fd(#[from(shared_runtime)] runtime: &Runtime) {
+        let temp_dir = tempdir::TempDir::new("test_shared_rt_thread_leak").unwrap();
+        let session = Session::new(
+            DummyFS {},
+            temp_dir.path(),
+            &Config {
+                mount_options: vec![],
+                acl: SessionACL::Owner,
+                runtime_strategy: RuntimeStrategy::Unmanaged {
+                    n_event_loop_workers: Some(NonZero::new(2).unwrap()),
+                    handle: runtime.handle().clone(),
+                },
+                clone_fd: true,
+            },
+        )
+        .await
+        .unwrap();
+        let bg_session = session.spawn().unwrap();
+        let _dummy = File::open(temp_dir.path().join("dummy"))
+            .await
+            .expect_err("nothing is implemented");
+        bg_session.umount_and_join(&[]).await.unwrap();
     }
 }

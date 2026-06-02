@@ -110,27 +110,50 @@ impl DevFuse {
         // SAFETY: fuse_dev_ioc_clone is a valid ioctl for /dev/fuse
         let target_fd_borrowed = fuse.as_fd();
         let source_fd_borrowed = self.file.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(|scope| {
-                scope.spawn_blocking(move || -> io::Result<()> {
-                    let mut source_fd_raw = source_fd_borrowed.as_raw_fd() as u32;
-                    crate::ll::ioctl::fuse_dev_ioc_clone(
-                        target_fd_borrowed.as_raw_fd(),
-                        &mut source_fd_raw,
-                    )?;
-                    Ok(())
-                });
-            })
-        }
-        .await;
-        let future = futures.pop().expect("no future returned");
-        future.expect("failed to join future")?;
-        let mut registered = client
+        let mut source_fd_raw = source_fd_borrowed.as_raw_fd() as u32;
+        unsafe {
+            crate::ll::ioctl::fuse_dev_ioc_clone(
+                target_fd_borrowed.as_raw_fd(),
+                &mut source_fd_raw,
+            )?
+        };
+        let registered = client
             .register_owned(fuse)
             .map::<Box<dyn UringTarget + Send + Sync>, _>(|f| Box::new(f))
             .unwrap_or_else(|e| Box::new(e.1));
-        client.set_nonblocking(&mut registered, true).await?;
+        // FIXME: higher level function run into a TSAN thread leak error
+        let old_flags = OFlag::from_bits_retain(nix::fcntl::fcntl(
+            registered.as_file_descriptor(),
+            nix::fcntl::FcntlArg::F_GETFL,
+        )?);
+        nix::fcntl::fcntl(
+            registered.as_file_descriptor(),
+            nix::fcntl::FcntlArg::F_SETFL(old_flags | OFlag::O_NONBLOCK),
+        )?;
+        // client.set_nonblocking(&mut registered, true).await?;
         let file = AsyncFd::new(DevFuseTarget(registered))?;
         Ok(Self { client, file })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{MountOption, SessionACL, mnt::Mount};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_dev_fuse_mount() {
+        let temp_dir =
+            tempdir::TempDir::new("test_dev_fuse_open").expect("failed to create temp dir");
+        let (dev_fuse, _mount) = Mount::new(
+            temp_dir.path(),
+            &[MountOption::AutoUnmount],
+            SessionACL::Owner,
+        )
+        .await
+        .expect("failed to mount DevFuse");
+        let dev_fuse_clone = dev_fuse.clone_fd().await.expect("failed to clone dev fuse");
+        assert!(dev_fuse.as_raw_fd() != dev_fuse_clone.as_raw_fd());
     }
 }

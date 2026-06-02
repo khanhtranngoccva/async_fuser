@@ -282,6 +282,8 @@ pub struct Session<FS: Filesystem> {
     pub(crate) handle: Handle,
     /// Managed runtime for the session.
     pub(crate) managed_runtime: Option<DroppableRuntime>,
+    /// Task tracker for the session.
+    pub(crate) task_tracker: TaskTracker,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -334,6 +336,7 @@ impl<FS: Filesystem> Session<FS> {
             cancellation_token: token,
             handle,
             managed_runtime,
+            task_tracker: TaskTracker::new(),
         };
 
         session.handshake().await?;
@@ -359,6 +362,7 @@ impl<FS: Filesystem> Session<FS> {
             cancellation_token: CancellationToken::new(),
             handle,
             managed_runtime,
+            task_tracker: TaskTracker::new(),
         };
         session.handshake().await?;
         Ok(session)
@@ -366,12 +370,14 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the given session ends.
-    pub fn spawn(self) -> io::Result<BackgroundSession> {
+    pub fn spawn(mut self) -> io::Result<BackgroundSession> {
         let sender = self.ch.sender();
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *self.mount.mount.lock());
         // Spawn the session loop in a background thread.
         let handle = self.handle.clone();
+        let managed_runtime = self.managed_runtime.take();
+        let task_tracker = self.task_tracker.clone();
         let task = tokio::task::Builder::new()
             .name("async_fuser::background")
             .spawn_on(self.run_internal(), &handle)?;
@@ -379,6 +385,8 @@ impl<FS: Filesystem> Session<FS> {
             guard: Some(task),
             sender,
             mount,
+            task_tracker,
+            _runtime: managed_runtime,
         })
     }
 
@@ -394,9 +402,9 @@ impl<FS: Filesystem> Session<FS> {
             cancellation_token,
             handle,
             managed_runtime: _managed_runtime,
+            task_tracker,
         } = self;
 
-        let handler_task_tracker = TaskTracker::new();
         let mut event_loop_tasks = JoinSet::new();
         let mut filesystem = Arc::new(filesystem);
 
@@ -406,7 +414,11 @@ impl<FS: Filesystem> Session<FS> {
             if config.clone_fd {
                 #[cfg(target_os = "linux")]
                 {
-                    channels.push(primary_channel.clone_fd().await?);
+                    channels.push(
+                        task_tracker
+                            .track_future(primary_channel.clone_fd())
+                            .await?,
+                    );
                     continue;
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -431,13 +443,16 @@ impl<FS: Filesystem> Session<FS> {
                 session_owner,
                 cancellation_token: cancellation_token.child_token(),
                 handler_runtime: handle.clone(),
-                task_tracker: handler_task_tracker.clone(),
+                task_tracker: task_tracker.clone(),
                 cancel_manager: cancel_manager.clone(),
             };
             event_loop_tasks
                 .build_task()
                 .name("async_fuser::event_loop")
-                .spawn_on(async move { event_loop.event_loop().await }, &handle)?;
+                .spawn_on(
+                    task_tracker.track_future(async move { event_loop.event_loop().await }),
+                    &handle,
+                )?;
         }
 
         // Wait until all event loop tasks are completed.
@@ -455,9 +470,9 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
 
-        // Wait until all tasks spawned by the event loop and handler runtime are completed.
-        handler_task_tracker.close();
-        handler_task_tracker.wait().await;
+        // Must ensure that there are no references to the filesystem before cleaning up
+        task_tracker.close();
+        task_tracker.wait().await;
 
         // Destroy the filesystem.
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
@@ -760,6 +775,10 @@ pub struct BackgroundSession {
     sender: ChannelSender,
     /// Ensures the filesystem is unmounted when the session ends
     mount: Option<Mount>,
+    /// Task tracker for the background session
+    task_tracker: TaskTracker,
+    /// Stores the managed runtime if necessary
+    _runtime: Option<DroppableRuntime>,
 }
 
 impl BackgroundSession {
@@ -773,6 +792,8 @@ impl BackgroundSession {
                 }
             }
         }
+        self.task_tracker.close();
+        self.task_tracker.wait().await;
         if let Some(guard) = self.guard.take() {
             guard.await.map_err(io::Error::other)??
         }
@@ -820,11 +841,12 @@ impl BackgroundSession {
 
     /// Join the filesystem thread without unmounting.
     pub async fn join(mut self) -> io::Result<()> {
+        self.task_tracker.close();
+        self.task_tracker.wait().await;
         if let Some(guard) = self.guard.take() {
-            guard.await.map_err(io::Error::other)?
-        } else {
-            Ok(())
+            guard.await.map_err(io::Error::other)??;
         }
+        Ok(())
     }
 }
 
@@ -939,7 +961,7 @@ mod tests {
                     n_event_loop_workers: Some(NonZero::new(2).unwrap()),
                     handle: runtime.handle().clone(),
                 },
-                clone_fd: true,
+                clone_fd: false,
             },
         )
         .await

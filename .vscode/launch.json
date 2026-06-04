@@ -1,0 +1,46 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug executable 'memory_footprint' with scenario 'DummyFilesystems'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=memory_footprint",
+                    "--package=memory_footprint",
+                    "--",
+                    "dummy-filesystems"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'memory_footprint'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=memory_footprint",
+                    "--package=memory_footprint"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'async_fuser'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=async_fuser"
+                ]
+            }
+        }
+    ]
+}

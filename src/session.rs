@@ -919,6 +919,25 @@ mod tests {
         drop(bg_session);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test]
+    async fn test_session_lifecycle_with_sync_drop_in_mt_context() {
+        // Create a temporary directory to mount the filesystem to
+        let temp_dir = tempdir::TempDir::new("test_session_lifecycle").unwrap();
+        let mount_point = temp_dir.path();
+
+        // Create a session
+        let session = Session::new(DummyFS {}, mount_point, &Config::default())
+            .await
+            .unwrap();
+
+        // Spawn the background session
+        let bg_session = session.spawn().unwrap();
+
+        // Unmount the session using sync mode in a current thread runtime to simulate the function being called from a Drop impl, should not deadlock with internal tasks
+        drop(bg_session);
+    }
+
     #[tokio::test]
     #[test_log::test]
     async fn test_runtime_strategy_in_current_thread_context() {

@@ -72,7 +72,6 @@ impl DevFuse {
     pub(crate) const PATH: &'static str = "/dev/fuse";
 
     pub(crate) async fn open() -> io::Result<Self> {
-        // TODO: make this configurable
         let client = Arc::new(Client::build(UringCfg::default()).map_err(io::Error::other)?);
         let fuse = client
             .open_path(Self::PATH, OFlag::O_RDWR, Permissions::from_mode(0))

@@ -264,7 +264,6 @@ async fn detect_fusermount_bin() -> String {
             .expect("FUSERMOUNT_PATH is not UTF-8")
             .to_owned();
     }
-
     for name in [
         FUSERMOUNT3_BIN.to_string(),
         FUSERMOUNT_BIN.to_string(),

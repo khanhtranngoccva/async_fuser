@@ -1,0 +1,15 @@
+[package]
+name = "memory_footprint"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = "1.52.3"
+memory-stats = "1.2.0"
+clap = { version = "4.6.1", features = ["derive"] }
+stats_alloc = "0.1.10"
+async_hybrid_fs = { git = "https://github.com/khanhtranngoccva/async_hybrid_fs", rev = "764855ef794719bc50f143c4549558c76cb65769", version = "0.1.0", features = ["pending-io-futures"] }
+async_fuser = { path = "../.." }
+tempdir = "0.3.7"
+nix = { version = "0.31.2", features = ["fs", "signal", "user"] }
+env_logger = "0.11.10"

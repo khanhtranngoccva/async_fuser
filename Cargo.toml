@@ -46,3 +46,6 @@ unstable-lookup-backing = []
 [dev-dependencies]
 tempdir = "0.3.7"
 test-log = "0.2.19"
+
+[workspace]
+members = ["benches/memory_footprint"]

@@ -44,6 +44,7 @@ macos-no-mount = []
 unstable-lookup-backing = []
 
 [dev-dependencies]
+console-subscriber = "0.5.0"
 tempdir = "0.3.7"
 test-log = "0.2.19"
 

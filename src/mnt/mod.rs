@@ -78,8 +78,7 @@ impl Mount {
     }
 }
 
-// FIXME: Integrate async if possible
-async fn is_mounted(fuse_device: &DevFuse) -> bool {
+fn is_mounted(fuse_device: &DevFuse) -> bool {
     use std::os::unix::io::AsFd;
     use std::slice;
 

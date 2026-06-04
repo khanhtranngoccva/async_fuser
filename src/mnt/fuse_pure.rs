@@ -78,7 +78,7 @@ async fn unmount_state_obj(
         Some(state) => state,
         None => return Ok(()),
     };
-    if !is_mounted(&state_internal.fuse_device).await {
+    if !is_mounted(&state_internal.fuse_device) {
         // If the filesystem has already been unmounted, avoid unmounting it again.
         // Unmounting it a second time could cause a race with a newly mounted filesystem
         // living at the same mountpoint
@@ -88,7 +88,7 @@ async fn unmount_state_obj(
     if let Err(err) = super::libc_umount(&state_internal.mountpoint, flags).await {
         // If the filesystem is gone, we need to clear the state and prevent the
         // unmount function from being called again.
-        if !is_mounted(&state_internal.fuse_device).await {
+        if !is_mounted(&state_internal.fuse_device) {
             *state = None;
             return Err(err.into());
         }
@@ -96,7 +96,7 @@ async fn unmount_state_obj(
         // library go through the setuid-root "fusermount -u" to unmount.
         else if err == nix::errno::Errno::EPERM {
             if let Err(e) = fuse_unmount_pure(&state_internal.mountpoint, flags).await {
-                if !is_mounted(&state_internal.fuse_device).await {
+                if !is_mounted(&state_internal.fuse_device) {
                     *state = None;
                 }
                 return Err(e);
@@ -138,7 +138,7 @@ impl MountImpl {
         if state.is_none() {
             return false;
         }
-        is_mounted(&state.unwrap().fuse_device).await
+        is_mounted(&state.unwrap().fuse_device)
     }
 
     pub(crate) async fn umount_impl(&mut self, flags: &[UnmountOption]) -> io::Result<()> {
@@ -380,7 +380,6 @@ unsafe fn clear_cloexec_in_pre_exec(command: &mut Command, fd: BorrowedFd<'_>) {
     };
 }
 
-// FIXME: Integrate async if possible for fcntl
 async fn fuse_mount_fusermount(
     mountpoint: &OsStr,
     options: &[MountOption],

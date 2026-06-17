@@ -16,10 +16,8 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::runtime::Handle;
+use std::time::Duration;
 use tokio::runtime::RuntimeFlavor;
-use tokio::task::JoinHandle;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -60,6 +58,8 @@ use crate::request::CancelManager;
 use crate::request::RequestWithSender;
 use crate::runtime;
 use crate::runtime::DroppableRuntime;
+use crate::spawner::Joinable;
+use crate::spawner::Spawner;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -94,16 +94,18 @@ impl SessionACL {
 /// Runtime strategy for the session. Controls how internal tasks are spawned.
 ///
 /// In the optimal scenario, it tries to use the current thread's runtime handle if it is a multi-threaded runtime. Otherwise, it will use a managed strategy. However, applications should manually configure this enum to avoid unpredictable behavior.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum RuntimeStrategy {
     /// Use a caller-managed handle to spawn the session. This is the recommended option because it allows scaling to multiple filesystems without risk of thread oversubscription.
     ///
     /// The handle must point to a multi-threaded Tokio runtime to avoid a deadlock. Passing a current-thread handle will return an error.
     Unmanaged {
-        /// Number of event loop workers to spawn on the runtime. 1 worker per filesystem is by default.
+        /// Number of event loop worker partitions to spawn on the runtime. 1 worker per filesystem is by default.
         n_event_loop_workers: Option<NonZero<usize>>,
-        /// Handle to the runtime to use.
-        handle: tokio::runtime::Handle,
+        /// Spawner to use for event loop workers.
+        event_loop_spawner: Arc<dyn Spawner<io::Result<()>>>,
+        /// Spawner to use for handler workers.
+        handler_spawner: Arc<dyn Spawner<()>>,
     },
     /// Spawn a managed runtime for the session. This option is not recommended because it causes thread oversubscription if multiple filesystems are used.
     Managed {
@@ -114,15 +116,39 @@ pub enum RuntimeStrategy {
     },
 }
 
+impl Debug for RuntimeStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeStrategy::Unmanaged {
+                n_event_loop_workers,
+                ..
+            } => f
+                .debug_struct("RuntimeStrategy::Unmanaged")
+                .field("n_event_loop_workers", &n_event_loop_workers)
+                .finish(),
+            RuntimeStrategy::Managed {
+                n_event_loop_workers,
+                n_handler_workers,
+            } => f
+                .debug_struct("RuntimeStrategy::Managed")
+                .field("n_event_loop_workers", &n_event_loop_workers)
+                .field("n_handler_workers", &n_handler_workers)
+                .finish(),
+        }
+    }
+}
+
 impl Default for RuntimeStrategy {
     fn default() -> Self {
         let handle = tokio::runtime::Handle::try_current();
         if let Ok(handle) = handle
             && handle.runtime_flavor() == RuntimeFlavor::MultiThread
         {
+            let handle = Arc::new(handle);
             RuntimeStrategy::Unmanaged {
                 n_event_loop_workers: None,
-                handle,
+                event_loop_spawner: handle.clone(),
+                handler_spawner: handle.clone(),
             }
         } else {
             RuntimeStrategy::Managed {
@@ -131,6 +157,13 @@ impl Default for RuntimeStrategy {
             }
         }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeState {
+    event_loop_spawner: Arc<dyn Spawner<io::Result<()>>>,
+    handler_spawner: Arc<dyn Spawner<()>>,
+    core_spawner: Arc<dyn Spawner<io::Result<()>>>,
 }
 
 impl RuntimeStrategy {
@@ -142,11 +175,21 @@ impl RuntimeStrategy {
             ));
         }
         match self {
-            RuntimeStrategy::Unmanaged { handle, .. } => {
-                if handle.runtime_flavor() != RuntimeFlavor::MultiThread {
+            RuntimeStrategy::Unmanaged {
+                handler_spawner,
+                event_loop_spawner,
+                ..
+            } => {
+                if !handler_spawner.is_valid() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "unmanaged runtime strategy must be used with a multi-threaded runtime",
+                        "handler spawner is not valid",
+                    ));
+                }
+                if !event_loop_spawner.is_valid() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "event loop spawner is not valid",
                     ));
                 }
             }
@@ -170,9 +213,17 @@ impl RuntimeStrategy {
     }
 
     /// Build the managed runtime for the runtime strategy if necessary and return a valid handle to a multi-threaded runtime.
-    pub(crate) fn build(&self) -> Result<(Handle, Option<DroppableRuntime>), io::Error> {
+    pub(crate) fn build(&self) -> Result<RuntimeState, io::Error> {
         match self {
-            RuntimeStrategy::Unmanaged { handle, .. } => Ok((handle.clone(), None)),
+            RuntimeStrategy::Unmanaged {
+                event_loop_spawner,
+                handler_spawner,
+                ..
+            } => Ok(RuntimeState {
+                event_loop_spawner: event_loop_spawner.clone(),
+                handler_spawner: handler_spawner.clone(),
+                core_spawner: Arc::new(DroppableRuntime::new("afuser-core", 1, false)?),
+            }),
             RuntimeStrategy::Managed {
                 n_event_loop_workers,
                 n_handler_workers,
@@ -180,12 +231,23 @@ impl RuntimeStrategy {
             } => {
                 let n_event_loop_workers = n_event_loop_workers.map(NonZero::get).unwrap_or(1);
                 let n_handler_workers = n_handler_workers.map(NonZero::get).unwrap_or(1);
-                let runtime = DroppableRuntime::new(
-                    "afuser-hnd",
-                    n_event_loop_workers + n_handler_workers,
-                    false,
-                )?;
-                Ok((runtime.handle().clone(), Some(runtime)))
+                let event_loop_pool: Arc<dyn Spawner<io::Result<()>>> =
+                    Arc::new(rusty_pool::ThreadPool::new(
+                        n_event_loop_workers,
+                        n_event_loop_workers,
+                        Duration::from_secs(0),
+                    ));
+                // Handler pool may opt out of using async so we need to create a separate pool.
+                let handler_pool: Arc<dyn Spawner<()>> = Arc::new(rusty_pool::ThreadPool::new(
+                    n_handler_workers,
+                    n_handler_workers,
+                    Duration::from_secs(0),
+                ));
+                Ok(RuntimeState {
+                    event_loop_spawner: event_loop_pool,
+                    handler_spawner: handler_pool,
+                    core_spawner: Arc::new(DroppableRuntime::new("afuser-core", 1, false)?),
+                })
             }
         }
     }
@@ -261,7 +323,6 @@ impl Drop for UmountOnDrop {
 }
 
 /// The session data structure
-#[derive(Debug)]
 pub struct Session<FS: Filesystem> {
     /// Filesystem operation implementations. None after `destroy` called.
     pub(crate) filesystem: FilesystemHolder<FS>,
@@ -278,12 +339,26 @@ pub struct Session<FS: Filesystem> {
     pub(crate) config: Config,
     /// CancellationToken for the session. When the token is triggered, all event loops terminate.
     pub(crate) cancellation_token: CancellationToken,
-    /// Handle to the runtime for the session.
-    pub(crate) handle: Handle,
-    /// Managed runtime for the session.
-    pub(crate) managed_runtime: Option<DroppableRuntime>,
+    /// Handle to the event loop spawner.
+    pub(crate) event_loop_spawner: Arc<dyn Spawner<io::Result<()>>>,
+    /// Handle to the spawner for the session.
+    pub(crate) handler_spawner: Arc<dyn Spawner<()>>,
+    /// Core spawner for the session's main thread.
+    pub(crate) core_spawner: Arc<dyn Spawner<io::Result<()>>>,
     /// Task tracker for the session.
     pub(crate) task_tracker: TaskTracker,
+}
+
+impl<FS: Filesystem> Debug for Session<FS> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("ch", &self.ch)
+            .field("mount", &self.mount)
+            .field("session_owner", &self.session_owner)
+            .field("proto_version", &self.proto_version)
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -306,7 +381,7 @@ impl<FS: Filesystem> Session<FS> {
 
         // Ensure the internal dependencies are ready first.
         let token = CancellationToken::new();
-        let (handle, managed_runtime) = options.runtime_strategy.build()?;
+        let state = options.runtime_strategy.build()?;
 
         // Perform the mount.
         let mountpoint = mountpoint.as_ref();
@@ -334,8 +409,9 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: None,
             config: options.clone(),
             cancellation_token: token,
-            handle,
-            managed_runtime,
+            event_loop_spawner: state.event_loop_spawner,
+            handler_spawner: state.handler_spawner,
+            core_spawner: state.core_spawner,
             task_tracker: TaskTracker::new(),
         };
 
@@ -347,7 +423,7 @@ impl<FS: Filesystem> Session<FS> {
     /// filesystem anywhere; that must be done separately.
     pub async fn from_fd(filesystem: FS, fd: OwnedFd, config: Config) -> io::Result<Self> {
         config.runtime_strategy.verify()?;
-        let (handle, managed_runtime) = config.runtime_strategy.build()?;
+        let state = config.runtime_strategy.build()?;
 
         let ch = Channel::new(Arc::new(DevFuse::try_from_fd(fd).await?));
         let mut session = Session {
@@ -360,8 +436,9 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: None,
             config,
             cancellation_token: CancellationToken::new(),
-            handle,
-            managed_runtime,
+            event_loop_spawner: state.event_loop_spawner,
+            handler_spawner: state.handler_spawner,
+            core_spawner: state.core_spawner,
             task_tracker: TaskTracker::new(),
         };
         session.handshake().await?;
@@ -370,23 +447,20 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the given session ends.
-    pub fn spawn(mut self) -> io::Result<BackgroundSession> {
+    pub fn spawn(self) -> io::Result<BackgroundSession> {
         let sender = self.ch.sender();
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *self.mount.mount.lock());
         // Spawn the session loop in a background thread.
-        let handle = self.handle.clone();
-        let managed_runtime = self.managed_runtime.take();
+        let spawner = self.core_spawner.clone();
         let task_tracker = self.task_tracker.clone();
-        let task = tokio::task::Builder::new()
-            .name("async_fuser::background")
-            .spawn_on(self.run_internal(), &handle)?;
+        let task = spawner.spawn("async_fuser::background", Box::pin(self.run_internal()))?;
         Ok(BackgroundSession {
             guard: Some(task),
             sender,
             mount,
             task_tracker,
-            _runtime: managed_runtime,
+            _spawner: spawner,
         })
     }
 
@@ -400,12 +474,12 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: _,
             config,
             cancellation_token,
-            handle,
-            managed_runtime: _managed_runtime,
+            core_spawner: _managed_runtime,
+            event_loop_spawner,
+            handler_spawner,
             task_tracker,
         } = self;
 
-        let mut event_loop_tasks = JoinSet::new();
         let mut filesystem = Arc::new(filesystem);
 
         let n_event_loop_workers = config.runtime_strategy.event_loop_workers().get();
@@ -432,6 +506,7 @@ impl<FS: Filesystem> Session<FS> {
         channels.push(primary_channel);
 
         let cancel_manager = Arc::new(CancelManager::new());
+        let mut event_loop_tasks = vec![];
 
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = format!("fuser-{i}");
@@ -442,29 +517,36 @@ impl<FS: Filesystem> Session<FS> {
                 allowed: config.acl,
                 session_owner,
                 cancellation_token: cancellation_token.child_token(),
-                handler_runtime: handle.clone(),
+                handler_spawner: handler_spawner.clone(),
                 task_tracker: task_tracker.clone(),
                 cancel_manager: cancel_manager.clone(),
             };
-            event_loop_tasks
-                .build_task()
-                .name("async_fuser::event_loop")
-                .spawn_on(
-                    task_tracker.track_future(async move { event_loop.event_loop().await }),
-                    &handle,
-                )?;
+            let task = event_loop_spawner.spawn(
+                "async_fuser::event_loop",
+                Box::pin(task_tracker.track_future(async move { event_loop.event_loop().await })),
+            )?;
+            event_loop_tasks.push(task);
         }
 
         // Wait until all event loop tasks are completed.
         let mut reply: io::Result<()> = Ok(());
-        while let Some(result) = event_loop_tasks.join_next().await {
-            match result {
+        let mut event_loop_join_futs = event_loop_tasks
+            .into_iter()
+            .map(|task| task.join())
+            .collect::<Vec<_>>();
+        while !event_loop_join_futs.is_empty() {
+            let (current, _current_idx, remaining) =
+                futures::future::select_all(event_loop_join_futs).await;
+            event_loop_join_futs = remaining;
+            match current {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     reply = Err(e);
                 }
                 Err(_join_error) => {
                     reply = Err(io::Error::other("event loop thread panicked"));
+                    // Kill the remaining tasks
+                    cancellation_token.cancel();
                     break;
                 }
             }
@@ -723,7 +805,7 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) allowed: SessionACL,
     pub(crate) session_owner: Uid,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) handler_runtime: Handle,
+    pub(crate) handler_spawner: Arc<dyn Spawner<()>>,
     pub(crate) task_tracker: TaskTracker,
 }
 
@@ -767,18 +849,27 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
 }
 
 /// The background session data structure
-#[derive(Debug)]
 pub struct BackgroundSession {
     /// Thread guard of the background session
-    pub guard: Option<JoinHandle<io::Result<()>>>,
+    pub guard: Option<Box<dyn Joinable<io::Result<()>>>>,
     /// Object for creating Notifiers for client use
     sender: ChannelSender,
     /// Ensures the filesystem is unmounted when the session ends
     mount: Option<Mount>,
     /// Task tracker for the background session
     task_tracker: TaskTracker,
-    /// Stores the managed runtime if necessary
-    _runtime: Option<DroppableRuntime>,
+    /// Stores the core spawner
+    _spawner: Arc<dyn Spawner<io::Result<()>>>,
+}
+
+impl Debug for BackgroundSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundSession")
+            .field("sender", &self.sender)
+            .field("mount", &self.mount)
+            .field("task_tracker", &self.task_tracker)
+            .finish()
+    }
 }
 
 impl BackgroundSession {
@@ -795,7 +886,7 @@ impl BackgroundSession {
         self.task_tracker.close();
         self.task_tracker.wait().await;
         if let Some(guard) = self.guard.take() {
-            guard.await.map_err(io::Error::other)??
+            guard.join().await.map_err(io::Error::other)??
         }
         Ok(())
     }
@@ -819,7 +910,9 @@ impl BackgroundSession {
 
     /// Unmount with the detached flag, and retrieve the inner join handle so that cleanup tasks may wait on it.
     #[cfg(target_os = "linux")]
-    pub async fn umount_and_detach(mut self) -> Result<JoinHandle<io::Result<()>>, io::Error> {
+    pub async fn umount_and_detach(
+        mut self,
+    ) -> Result<Box<dyn Joinable<io::Result<()>>>, io::Error> {
         if let Some(mount) = self.mount.take() {
             match mount.umount(&[UnmountOption::Detach]).await {
                 Ok(()) => {}
@@ -844,7 +937,7 @@ impl BackgroundSession {
         self.task_tracker.close();
         self.task_tracker.wait().await;
         if let Some(guard) = self.guard.take() {
-            guard.await.map_err(io::Error::other)??;
+            guard.join().await.map_err(io::Error::other)??;
         }
         Ok(())
     }
@@ -865,7 +958,7 @@ impl Drop for BackgroundSession {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZero;
+    use std::{num::NonZero, sync::Arc};
 
     use tokio::{fs::File, runtime::Runtime};
 
@@ -961,8 +1054,10 @@ mod tests {
             strategy,
             RuntimeStrategy::Unmanaged {
                 n_event_loop_workers: None,
-                handle,
-            } if handle.metrics().num_workers() == 4
+                handler_spawner,
+                event_loop_spawner,
+            } if Arc::downcast::<tokio::runtime::Handle>(event_loop_spawner.clone()).unwrap().metrics().num_workers() == 4
+            && Arc::downcast::<tokio::runtime::Handle>(handler_spawner.clone()).unwrap().metrics().num_workers() == 4
         ));
     }
 
@@ -978,7 +1073,8 @@ mod tests {
                 acl: SessionACL::Owner,
                 runtime_strategy: RuntimeStrategy::Unmanaged {
                     n_event_loop_workers: Some(NonZero::new(2).unwrap()),
-                    handle: runtime.handle().clone(),
+                    event_loop_spawner: Arc::new(runtime.handle().clone()),
+                    handler_spawner: Arc::new(runtime.handle().clone()),
                 },
                 clone_fd: false,
             },

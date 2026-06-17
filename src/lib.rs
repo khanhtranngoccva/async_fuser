@@ -99,6 +99,7 @@ mod runtime;
 mod session;
 mod time;
 pub mod examples;
+pub mod spawner;
 
 use crate::ll::flags::init_flags;
 

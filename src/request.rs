@@ -224,9 +224,8 @@ impl<'a> RequestWithSender<'a> {
                         Err(errno) => reply.error(errno).await,
                     }
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::interrupt")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::interrupt", Box::pin(task))?;
             }
             ll::Operation::Lookup(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -235,18 +234,16 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.lookup(&header, nodeid, &name, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::lookup")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::lookup", Box::pin(task))?;
             }
             ll::Operation::Forget(x) => {
                 let nlookup = x.nlookup();
                 let task = se.task_tracker.track_future(async move {
                     filesystem.forget(&header, nodeid, nlookup).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::forget")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::forget", Box::pin(task))?;
             }
             ll::Operation::GetAttr(_attr) => {
                 let fh = _attr.file_handle();
@@ -255,9 +252,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.getattr(&header, nodeid, fh, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::getattr")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::getattr", Box::pin(task))?;
             }
             ll::Operation::SetAttr(x) => {
                 let mode = x.mode();
@@ -282,9 +278,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::setattr")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::setattr", Box::pin(task))?;
             }
             ll::Operation::ReadLink(_) => {
                 let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
@@ -292,9 +287,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.readlink(&header, nodeid, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::readlink")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::readlink", Box::pin(task))?;
             }
             ll::Operation::MkNod(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -308,9 +302,8 @@ impl<'a> RequestWithSender<'a> {
                         .mknod(&header, nodeid, &name, mode, umask, rdev, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::mknod")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::mknod", Box::pin(task))?;
             }
             ll::Operation::MkDir(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -323,9 +316,8 @@ impl<'a> RequestWithSender<'a> {
                         .mkdir(&header, nodeid, &name, mode, umask, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::mkdir")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::mkdir", Box::pin(task))?;
             }
             ll::Operation::Unlink(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -334,9 +326,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.unlink(&header, nodeid, &name, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::unlink")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::unlink", Box::pin(task))?;
             }
             ll::Operation::RmDir(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -345,9 +336,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.rmdir(&header, nodeid, &name, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::rmdir")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::rmdir", Box::pin(task))?;
             }
             ll::Operation::SymLink(x) => {
                 let link_name = x.link_name().as_os_str().to_os_string();
@@ -359,9 +349,8 @@ impl<'a> RequestWithSender<'a> {
                         .symlink(&header, nodeid, &link_name, &target, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::symlink")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::symlink", Box::pin(task))?;
             }
             ll::Operation::Rename(x) => {
                 let src_name = x.src().name.as_os_str().to_os_string();
@@ -382,9 +371,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::rename")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::rename", Box::pin(task))?;
             }
             ll::Operation::Link(x) => {
                 let inode_no = x.inode_no();
@@ -396,9 +384,8 @@ impl<'a> RequestWithSender<'a> {
                         .link(&header, inode_no, nodeid, &dest_name, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::link")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::link", Box::pin(task))?;
             }
             ll::Operation::Open(x) => {
                 let flags = x.flags();
@@ -407,9 +394,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.open(&header, nodeid, flags, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::open")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::open", Box::pin(task))?;
             }
             ll::Operation::Read(x) => {
                 let file_handle = x.file_handle();
@@ -433,9 +419,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::read")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::read", Box::pin(task))?;
             }
             ll::Operation::Write(x) => {
                 let file_handle = x.file_handle();
@@ -462,9 +447,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::write")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::write", Box::pin(task))?;
             }
             ll::Operation::Flush(x) => {
                 let file_handle = x.file_handle();
@@ -476,9 +460,8 @@ impl<'a> RequestWithSender<'a> {
                         .flush(&header, nodeid, file_handle, lock_owner, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::flush")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::flush", Box::pin(task))?;
             }
             ll::Operation::Release(x) => {
                 let file_handle = x.file_handle();
@@ -500,9 +483,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::release")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::release", Box::pin(task))?;
             }
             ll::Operation::FSync(x) => {
                 let file_handle = x.file_handle();
@@ -514,9 +496,8 @@ impl<'a> RequestWithSender<'a> {
                         .fsync(&header, nodeid, file_handle, datasync, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::fsync")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::fsync", Box::pin(task))?;
             }
             ll::Operation::OpenDir(x) => {
                 let flags = x.flags();
@@ -525,9 +506,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.opendir(&header, nodeid, flags, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::opendir")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::opendir", Box::pin(task))?;
             }
             ll::Operation::ReadDir(x) => {
                 let file_handle = x.file_handle();
@@ -544,9 +524,8 @@ impl<'a> RequestWithSender<'a> {
                         .readdir(&header, nodeid, file_handle, offset, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::readdir")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::readdir", Box::pin(task))?;
             }
             ll::Operation::ReleaseDir(x) => {
                 let file_handle = x.file_handle();
@@ -558,9 +537,8 @@ impl<'a> RequestWithSender<'a> {
                         .releasedir(&header, nodeid, file_handle, flags, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::releasedir")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::releasedir", Box::pin(task))?;
             }
             ll::Operation::FSyncDir(x) => {
                 let file_handle = x.file_handle();
@@ -572,9 +550,8 @@ impl<'a> RequestWithSender<'a> {
                         .fsyncdir(&header, nodeid, file_handle, datasync, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::fsyncdir")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::fsyncdir", Box::pin(task))?;
             }
             ll::Operation::StatFs(_) => {
                 let cancel_cookie = se.cancel_manager.register_cancel(self.request.unique());
@@ -582,9 +559,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.statfs(&header, nodeid, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::statfs")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::statfs", Box::pin(task))?;
             }
             ll::Operation::SetXAttr(x) => {
                 let name = x.name().to_os_string();
@@ -599,9 +575,8 @@ impl<'a> RequestWithSender<'a> {
                         .setxattr(&header, nodeid, &name, &value, flags, position, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::setxattr")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::setxattr", Box::pin(task))?;
             }
             ll::Operation::GetXAttr(x) => {
                 let name = x.name().to_os_string();
@@ -613,9 +588,8 @@ impl<'a> RequestWithSender<'a> {
                         .getxattr(&header, nodeid, &name, size, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::getxattr")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::getxattr", Box::pin(task))?;
             }
             ll::Operation::ListXAttr(x) => {
                 let size = x.size();
@@ -624,9 +598,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.listxattr(&header, nodeid, size, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::listxattr")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::listxattr", Box::pin(task))?;
             }
             ll::Operation::RemoveXAttr(x) => {
                 let name = x.name().to_os_string();
@@ -635,9 +608,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.removexattr(&header, nodeid, &name, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::removexattr")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::removexattr", Box::pin(task))?;
             }
             ll::Operation::Access(x) => {
                 let mask = x.mask();
@@ -646,9 +618,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.access(&header, nodeid, mask, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::access")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::access", Box::pin(task))?;
             }
             ll::Operation::Create(x) => {
                 let name = x.name().as_os_str().to_os_string();
@@ -662,9 +633,8 @@ impl<'a> RequestWithSender<'a> {
                         .create(&header, nodeid, &name, mode, umask, flags, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::create")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::create", Box::pin(task))?;
             }
             ll::Operation::GetLk(x) => {
                 let file_handle = x.file_handle();
@@ -690,9 +660,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::getlk")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::getlk", Box::pin(task))?;
             }
             ll::Operation::SetLk(x) => {
                 let file_handle = x.file_handle();
@@ -720,9 +689,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::setlk")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::setlk", Box::pin(task))?;
             }
             ll::Operation::BMap(x) => {
                 let block_size = x.block_size();
@@ -734,9 +702,8 @@ impl<'a> RequestWithSender<'a> {
                         .bmap(&header, nodeid, block_size, block, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::bmap")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::bmap", Box::pin(task))?;
             }
             ll::Operation::IoCtl(x) => {
                 if x.unrestricted() {
@@ -764,9 +731,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::ioctl")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::ioctl", Box::pin(task))?;
             }
             ll::Operation::Poll(x) => {
                 let file_handle = x.file_handle();
@@ -780,9 +746,8 @@ impl<'a> RequestWithSender<'a> {
                         .poll(&header, nodeid, file_handle, ph, events, flags, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::poll")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::poll", Box::pin(task))?;
             }
             ll::Operation::NotifyReply(_) => {
                 // TODO: handle FUSE_NOTIFY_REPLY
@@ -793,9 +758,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.batch_forget(&header, &nodes).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::batch_forget")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::batch_forget", Box::pin(task))?;
             }
             ll::Operation::FAllocate(x) => {
                 let file_handle = x.file_handle();
@@ -809,9 +773,8 @@ impl<'a> RequestWithSender<'a> {
                         .fallocate(&header, nodeid, file_handle, offset, len, mode, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::fallocate")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::fallocate", Box::pin(task))?;
             }
             ll::Operation::ReadDirPlus(x) => {
                 let file_handle = x.file_handle();
@@ -829,9 +792,8 @@ impl<'a> RequestWithSender<'a> {
                         .readdirplus(&header, nodeid, file_handle, offset, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::readdirplus")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::readdirplus", Box::pin(task))?;
             }
             ll::Operation::Rename2(x) => {
                 let from_dir = x.from().dir;
@@ -848,9 +810,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::rename")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::rename", Box::pin(task))?;
             }
             ll::Operation::Lseek(x) => {
                 let file_handle = x.file_handle();
@@ -863,9 +824,8 @@ impl<'a> RequestWithSender<'a> {
                         .lseek(&header, nodeid, file_handle, offset, whence, reply)
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::lseek")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::lseek", Box::pin(task))?;
             }
             ll::Operation::CopyFileRange(x) => {
                 let (i, o) = (x.src()?, x.dest()?);
@@ -889,9 +849,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::copy_file_range")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::copy_file_range", Box::pin(task))?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::SetVolName(x) => {
@@ -901,9 +860,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.setvolname(&header, &name, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::setvolname")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::setvolname", Box::pin(task))?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes(x) => {
@@ -912,9 +870,8 @@ impl<'a> RequestWithSender<'a> {
                 let task = se.task_tracker.track_future(async move {
                     filesystem.getxtimes(&header, nodeid, reply).await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::getxtimes")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::getxtimes", Box::pin(task))?;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange(x) => {
@@ -932,9 +889,8 @@ impl<'a> RequestWithSender<'a> {
                         )
                         .await;
                 });
-                tokio::task::Builder::new()
-                    .name("async_fuser::handler::exchange")
-                    .spawn_on(task, &se.handler_runtime)?;
+                se.handler_spawner
+                    .spawn("async_fuser::handler::exchange", Box::pin(task))?;
             }
             ll::Operation::CuseInit(_) => {
                 // TODO: handle CUSE_INIT
